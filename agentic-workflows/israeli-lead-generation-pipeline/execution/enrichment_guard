@@ -1,0 +1,128 @@
+"""
+Enrichment Guard - Skip leads already in Google Sheet.
+Checks Place ID, Website (domain-level), and Name+City.
+"""
+import re
+from typing import Dict, List, Set, Tuple
+from urllib.parse import urlparse
+
+
+class EnrichmentGuard:
+    """
+    Lightweight guard to skip leads that already exist in the target sheet.
+    """
+
+    def __init__(self, existing_leads: List[Dict]):
+        """
+        Initialize with existing leads from the sheet.
+        
+        Args:
+            existing_leads: List of dicts with keys: lead_id, business_name, city, website
+        """
+        self.lead_ids: Set[str] = set()
+        self.websites: Set[str] = set()
+        self.name_city_pairs: Set[str] = set()
+        
+        for lead in existing_leads:
+            # Index by lead_id
+            lid = lead.get("lead_id")
+            if lid and isinstance(lid, str):
+                lid = lid.strip()
+            if lid:
+                self.lead_ids.add(lid.lower())
+            
+            # Index by normalized website domain
+            website = lead.get("website", "")
+            norm_url = self._normalize_url(website)
+            if norm_url:
+                self.websites.add(norm_url)
+            
+            # Index by name+city (only if city is present)
+            name = lead.get("business_name", "")
+            city = lead.get("city", "")
+            if name and city:
+                key = self._make_name_city_key(name, city)
+                if key:
+                    self.name_city_pairs.add(key)
+        
+        print(f"[Enrichment Guard] Loaded {len(self.lead_ids)} IDs, "
+              f"{len(self.websites)} websites, {len(self.name_city_pairs)} name+city pairs", flush=True)
+
+    def _normalize_url(self, url: str) -> str:
+        """Normalize URL to domain-level for comparison."""
+        if not url:
+            return ""
+        url = url.strip().lower()
+        
+        # Add scheme if missing for parsing
+        if not url.startswith(("http://", "https://")):
+            url = "http://" + url
+        
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc
+            # Remove www. prefix
+            if domain.startswith("www."):
+                domain = domain[4:]
+            return domain
+        except Exception:
+            return ""
+
+    def _normalize_text(self, text: str) -> str:
+        """Normalize Hebrew/English text for comparison."""
+        if not text:
+            return ""
+        text = text.strip().lower()
+        # Replace hyphens with spaces (for city names like תל-אביב vs תל אביב)
+        text = text.replace("-", " ")
+        # Remove punctuation and extra spaces
+        text = re.sub(r'[^\w\s\u0590-\u05FF]', '', text)  # Keep Hebrew chars
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    def _make_name_city_key(self, name: str, city: str) -> str:
+        """Create a normalized key from name + city."""
+        norm_name = self._normalize_text(name)
+        norm_city = self._normalize_text(city)
+        if norm_name and norm_city:
+            return f"{norm_name}|{norm_city}"
+        return ""
+
+    def is_duplicate(self, lead: Dict) -> Tuple[bool, str]:
+        """
+        Check if a lead is a duplicate of an existing entry.
+        
+        Args:
+            lead: Raw lead dict from Apify (keys: placeId, title, website, city/address)
+            
+        Returns:
+            (is_duplicate: bool, reason: str or None)
+        """
+        # 1. Check by place ID / lead_id
+        place_id_val = lead.get("placeId")
+        place_id = place_id_val.strip().lower() if place_id_val else ""
+        if place_id and place_id in self.lead_ids:
+            return (True, "SKIPPED_EXISTING:place_id")
+        
+        # Also check generated lead_id format if present
+        lead_id_val = lead.get("lead_id")
+        lead_id = lead_id_val.strip().lower() if lead_id_val else ""
+        if lead_id and lead_id in self.lead_ids:
+            return (True, "SKIPPED_EXISTING:lead_id")
+        
+        # 2. Check by website (domain-level)
+        website = lead.get("website", "")
+        norm_url = self._normalize_url(website)
+        if norm_url and norm_url in self.websites:
+            return (True, "SKIPPED_EXISTING:website")
+        
+        # 3. Check by name+city (only if city present)
+        name = lead.get("title", "") or lead.get("business_name", "")
+        city = lead.get("city", "") or lead.get("address", "")
+        
+        if name and city:
+            key = self._make_name_city_key(name, city)
+            if key and key in self.name_city_pairs:
+                return (True, "SKIPPED_EXISTING:name_city")
+        
+        return (False, None)
