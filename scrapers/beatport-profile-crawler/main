@@ -1,0 +1,96 @@
+import { Actor, log } from 'apify';
+import { PuppeteerCrawler } from 'crawlee';
+
+await Actor.init();
+
+const input = await Actor.getInput();
+let urls = input?.urls || [];
+
+if (!Array.isArray(urls) || urls.length === 0) {
+    throw new Error('Missing input: "urls" array is required.');
+}
+
+const proxyConfiguration = await Actor.createProxyConfiguration({
+    groups: ['RESIDENTIAL'],
+});
+
+const seenLabels = new Set();
+
+const crawler = new PuppeteerCrawler({
+    proxyConfiguration,
+    maxConcurrency: 1,
+    maxRequestsPerCrawl: urls.length,
+    useSessionPool: true,
+    requestHandlerTimeoutSecs: 60,
+
+    requestHandler: async ({ page, request }) => {
+        log.info(`➡️ Scraping: ${request.url}`);
+
+        try {
+            await page.goto(request.url, { timeout: 60000, waitUntil: 'domcontentloaded' });
+
+            let tracks = [];
+
+            // CASE 1: Top 100 structure
+            if (await page.$('[data-testid="tracks-table-row"]')) {
+                await page.waitForSelector('[data-testid="tracks-table-row"]', { timeout: 30000 });
+                tracks = await page.$$eval('[data-testid="tracks-table-row"]', (rows) =>
+                    rows.map(row => {
+                        const labelDiv = row.querySelector(
+                            '.label [data-testid="marquee-parent"] .Marquee-style__MarqueeElement-sc-d1a627da-0'
+                        );
+                        const label = labelDiv?.textContent?.trim() || null;
+                        return { label };
+                    }).filter(item => !!item.label)
+                );
+
+            // CASE 2: Releases (React) structure
+            } else if (await page.$('[data-testid="release-table-row"]')) {
+                await page.waitForSelector('[data-testid="release-table-row"]', { timeout: 30000 });
+                tracks = await page.$$eval('[data-testid="release-table-row"]', (rows) =>
+                    rows.map(row => {
+                        const labelEl = row.querySelector('[data-testid="label-link"]');
+                        const label = labelEl?.textContent?.trim() || null;
+                        return { label };
+                    }).filter(item => !!item.label)
+                );
+
+            // CASE 3: Fallback – כל <a> שמצביע על /label/
+            } else if (await page.$('a[href*="/label/"]')) {
+                await page.waitForSelector('a[href*="/label/"]', { timeout: 30000 });
+                tracks = await page.$$eval('a[href*="/label/"]', (links) => {
+                    const labelsSet = new Set();
+                    links.forEach(link => {
+                        const text = link.textContent?.trim();
+                        const href = link.getAttribute('href') || '';
+                        if (text && href.includes('/label/')) labelsSet.add(text);
+                    });
+                    return Array.from(labelsSet).map(label => ({ label }));
+                });
+
+            } else {
+                throw new Error('Unknown page structure – no known selectors matched.');
+            }
+
+            const uniqueTracks = tracks.filter(track => {
+                if (track.label && !seenLabels.has(track.label)) {
+                    seenLabels.add(track.label);
+                    return true;
+                }
+                return false;
+            });
+
+            log.info(`✅ Found ${uniqueTracks.length} unique labels`);
+            for (const track of uniqueTracks) {
+                await Actor.pushData(track);
+            }
+
+        } catch (err) {
+            log.error(`❌ Failed to extract data from page: ${err.message}`);
+        }
+    },
+});
+
+await crawler.run(urls.map(url => ({ url })));
+
+await Actor.exit();
