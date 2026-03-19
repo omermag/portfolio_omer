@@ -1,0 +1,44 @@
+# Lead Relevance Scoring
+
+**Goal**: Score leads in Google Sheet as High/Medium/Low based on relevance to gift/accessory campaign.
+
+## Inputs
+- Google Sheet URL with leads data
+- Columns required: `category`, `business_summary`, `business_name`
+- Target column: `lead_relevance`
+
+## Outputs
+- Updated `lead_relevance` column with: High, Medium, or Low
+
+## Tools & Scripts
+- `score_leads.py` - Main scoring script
+
+## Instructions
+
+### Run the Scorer
+```bash
+python score_leads.py
+```
+
+### Scoring Rules
+
+#### Automatic HIGH
+- Car agencies, showrooms, dealers, leasing, rentals
+
+#### Automatic LOW  
+- Parking, scrap yards, fuel, hotels, lawyers, insurance, tourism
+
+#### Requires LLM Analysis
+- Garages (authorized and non-authorized)
+- Repair shops, car washes, parts stores
+- Bicycle/motorcycle shops
+
+#### LLM Criteria
+- **High**: B2C, physical customers, purchase/delivery moments
+- **Medium**: B2C but unclear gift relevance
+- **Low**: B2B, fleet services, technical/industrial only
+
+## Edge Cases
+- Missing summary → defaults to Medium
+- Already scored → skips (won't overwrite)
+- LLM error → defaults to Medium
