@@ -1,0 +1,268 @@
+"""
+relevance_service.py - Batch Outlier Detection for Lead Relevance
+
+This module implements a "sanity check" layer for leads fetched from Google Maps.
+Instead of complex per-lead rules, it uses a batch LLM approach to identify
+semantic outliers relative to the user's search intent.
+
+Goal:
+- Contextual outlier detection (finding the "odd one out" in a batch).
+- specific prompt to identify clear mismatches.
+- fail-open logic (prefer false positives over false negatives).
+- batch processing for cost and speed efficiency.
+"""
+
+import os
+import json
+import re
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, asdict
+from difflib import SequenceMatcher
+import openai
+from dotenv import load_dotenv
+
+# Load env immediately
+load_dotenv()
+
+
+@dataclass
+class RelevanceResult:
+    """Standardized result for relevance checking."""
+    status: str  # "PASS" or "REJECT"
+    reason: str
+    source: str  # "HEURISTIC" or "LLM"
+    confidence: float = 1.0
+
+
+class BatchRelevanceValidator:
+    """
+    Stateless validator that uses batch LLM calls to identify leads
+    that clearly do not belong to the user's search intent.
+    """
+
+    BATCH_SIZE = 40
+    MODEL = "gpt-4o-mini"
+    
+    SYSTEM_PROMPT = """You are a data cleaner for a B2B lead list.
+Your goal is to identifying CLEAR OUTLIERS that do not belong to the user's search intent.
+Be conservative: We prefer False Positives (keeping bad leads) over False Negatives (losing good leads)."""
+
+    def __init__(self):
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            print("[BatchRelevanceValidator] WARNING: No OPENAI_API_KEY found. All leads will PASS.")
+        self.client = openai.OpenAI(api_key=self.api_key) if self.api_key else None
+
+    def validate_leads(self, leads: List[Dict[str, Any]], search_term: str) -> Dict[str, RelevanceResult]:
+        """
+        Main entry point. Validates a list of leads against a search term.
+        
+        Args:
+            leads: List of dicts, must contain 'id', 'name', 'category'.
+                   (If 'id' is missing, one will be assigned temporarily, but input should ideally have it).
+            search_term: The user's original search query (e.g. "Luxury Car Garage").
+            
+        Returns:
+            Dictionary mapping lead_id (str) -> RelevanceResult.
+        """
+        results: Dict[str, RelevanceResult] = {}
+        candidate_pool: List[Dict[str, Any]] = []
+        
+        # normalized search term for heuristics
+        norm_search = self._normalize(search_term)
+        
+        print(f"[BatchRelevanceValidator] Starting validation for {len(leads)} leads against '{search_term}'...")
+
+        # --- Phase 1: Fast Heuristics (Anchor Identification) ---
+        for lead in leads:
+            lead_id = str(lead.get("id", ""))
+            name = lead.get("name", "")
+            category = lead.get("category", "")
+            
+            if not lead_id:
+                # Should not happen in proper pipeline, but handle it
+                print(f"[BatchRelevanceValidator] Warning: Lead missing ID: {name}")
+                continue
+
+            # Check for obvious matches to save tokens
+            if self._is_obvious_match(norm_search, name, category):
+                results[lead_id] = RelevanceResult(
+                    status="PASS",
+                    reason=f"Strong heuristic match with '{search_term}'",
+                    source="HEURISTIC"
+                )
+            else:
+                candidate_pool.append({
+                    "id": lead_id,
+                    "name": name,
+                    "category": category
+                })
+
+        print(f"[BatchRelevanceValidator] Phase 1 complete. {len(results)} passed heuristics. {len(candidate_pool)} sent to LLM.")
+
+        # --- Phase 2: Batch LLM Processing ---
+        if candidate_pool and self.client:
+            # Chunk the candidates
+            chunks = [candidate_pool[i : i + self.BATCH_SIZE] for i in range(0, len(candidate_pool), self.BATCH_SIZE)]
+            
+            for chunk in chunks:
+                chunk_results = self._process_batch(chunk, search_term)
+                results.update(chunk_results)
+        elif candidate_pool and not self.client:
+             # Fallback if no API key
+            for item in candidate_pool:
+                results[item["id"]] = RelevanceResult(status="PASS", reason="No API Key", source="SYSTEM")
+
+        # Fill in any missing checks (Fail Open) - though logic above should cover all
+        # ensure every input lead has a result
+        final_output = {}
+        for lead in leads:
+            lid = str(lead.get("id", ""))
+            if lid in results:
+                final_output[lid] = results[lid]
+            else:
+                # Should normally be covered, but safety net
+                final_output[lid] = RelevanceResult(status="PASS", reason="Default fail-safe", source="SYSTEM")
+
+        return final_output
+
+    def _process_batch(self, batch: List[Dict[str, Any]], search_term: str) -> Dict[str, RelevanceResult]:
+        """
+        Sends a batch of leads to the LLM to identify outliers.
+        """
+        results = {}
+        
+        # Prepare the list for the prompt
+        # We only send minimal info: ID, Name, Category
+        input_list_str = "\n".join([
+            f"[id: {item['id']}] Name: {item['name']} | Cat: {item['category']}" 
+            for item in batch
+        ])
+
+        prompt = f"""
+User Intent: "{search_term}"
+
+Here is a list of {len(batch)} businesses found for this search term.
+Most of them belong to the correct industry or semantic cluster.
+Identify the businesses that are CLEARLY IRRELEVANT (Outliers).
+
+Strict Rules:
+1. REJECT if the business is clearly a different industry (e.g. "Restaurant" when searching for "Lawyer").
+2. PASS if it is related, overlapping, or even vaguely connected.
+3. PASS if you are uncertain.
+
+Input List:
+{input_list_str}
+
+Output strictly JSON in this format:
+{{
+  "rejected": [
+    {{"id": "the_id", "reason": "short reason why"}}
+  ]
+}}
+If no rejections, return {{"rejected": []}}.
+"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.MODEL,
+                messages=[
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0  # Deterministic
+            )
+            
+            content = response.choices[0].message.content
+            data = json.loads(content)
+            rejected_list = data.get("rejected", [])
+            
+            # Map rejections
+            rejected_map = {str(r["id"]): r.get("reason", "Outlier") for r in rejected_list}
+            
+            # Process results for this batch
+            for item in batch:
+                lid = str(item["id"])
+                if lid in rejected_map:
+                    results[lid] = RelevanceResult(
+                        status="REJECT", 
+                        reason=rejected_map[lid], 
+                        source="LLM",
+                        confidence=0.9
+                    )
+                else:
+                    results[lid] = RelevanceResult(
+                        status="PASS", 
+                        reason="Consensus with intent", 
+                        source="LLM",
+                        confidence=0.8
+                    )
+                    
+        except Exception as e:
+            print(f"[BatchRelevanceValidator] Error processing batch: {e}")
+            # FAIL OPEN: Mark all as PASS
+            for item in batch:
+                results[str(item["id"])] = RelevanceResult(
+                    status="PASS", 
+                    reason=f"LLM Error (Fail Open): {str(e)}", 
+                    source="SYSTEM"
+                )
+
+        return results
+
+    def _normalize(self, text: str) -> str:
+        if not text:
+            return ""
+        # simple lowercasing and basic cleanup
+        # handling Hebrew might need more if we want strict equality, but for fuzzy containment this is fine
+        return text.lower().strip()
+
+    def _is_obvious_match(self, norm_search: str, name: str, category: str) -> bool:
+        """
+        Returns True if the lead is 'obviously' relevant and doesn't need LLM check.
+        """
+        norm_name = self._normalize(name)
+        norm_cat = self._normalize(category)
+        
+        # 1. Exact/Substring category match
+        if norm_search in norm_cat or norm_cat in norm_search:
+            return True
+            
+        # 2. Search term appearing in name
+        if norm_search in norm_name:
+            return True
+        
+        # 3. High fuzzy match on category
+        # Using SequenceMatcher for simple ratio
+        if norm_cat and norm_search:
+            ratio = SequenceMatcher(None, norm_search, norm_cat).ratio()
+            if ratio > 0.8: # high threshold
+                return True
+                
+        return False
+
+# --- Quick Test (Can be run directly) ---
+if __name__ == "__main__":
+    # Mock data for testing
+    print("Running mock test...")
+    fake_leads = [
+        {"id": "1", "name": "Garage Yossi", "category": "Car Repair"},
+        {"id": "2", "name": "Cohen Law", "category": "Lawyer"},
+        {"id": "3", "name": "Pizza Hut", "category": "Restaurant"},
+        {"id": "4", "name": "David Motors", "category": "Auto Parts"},
+    ]
+    
+    validator = BatchRelevanceValidator()
+    # Assuming search is "Car Garage"
+    # "Garage Yossi" -> Should Pass (heuristic or LLM)
+    # "Cohen Law" -> Reject
+    # "Pizza Hut" -> Reject
+    # "David Motors" -> Pass
+    
+    try:
+        results = validator.validate_leads(fake_leads, "Car Garage")
+        for lid, res in results.items():
+            print(f"ID {lid}: {res.status} ({res.reason})")
+    except Exception as e:
+        print(f"Test failed: {e}")
