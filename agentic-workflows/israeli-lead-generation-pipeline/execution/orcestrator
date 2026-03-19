@@ -1,0 +1,420 @@
+import sys
+import os
+
+# Add execution directory to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+
+import argparse
+import asyncio
+from typing import List, Dict
+from datetime import datetime
+
+from apify_wrapper import fetch_leads_batch
+from scraper_service import scrape_website_multi_page
+from enrichment_service import enrich_lead
+from search_service import search_for_contact_info
+from drive_adapter import append_leads_to_sheet, fetch_existing_lead_identifiers
+from utils import generate_lead_id, is_valid_website
+from relevance_service import BatchRelevanceValidator
+from enrichment_guard import EnrichmentGuard
+import csv
+
+FOLDER_ID = "15BF9AUit6FKAnImOGKIQJ3a7-EhPb6-v"
+
+async def process_lead(raw_lead: Dict, category: str, skip_llm: bool = False) -> Dict:
+    """
+    Process a single lead through the full pipeline.
+    
+    Steps:
+    1. Validate website
+    2. Scrape (multi-page)
+    3. Layer 1 Enrichment (contact extraction)
+    4. Layer 2 Enrichment (LLM summary) - Skipped if skip_llm is True
+    5. Fallback search (if email missing)
+    6. Compile final lead
+    """
+    business_name = raw_lead.get('title', 'Unknown')
+    city = raw_lead.get('city', raw_lead.get('address', 'Unknown'))
+    website = raw_lead.get('website', '')
+    
+    lead = {
+        "lead_id": generate_lead_id(business_name, city),
+        "business_name": business_name,
+        "city": city,
+        "category": category,
+        "website": website,
+        "email": None,
+        "secondary_email": None,
+        "phone": raw_lead.get('phone'),  # Apify is source of truth
+        "business_summary": "",
+        "hooks": "",
+        "instagram": None,
+        "facebook": None,
+        "linkedin": None,
+        "x": None,
+        "additional_contact_form": None,
+        "founder": None,
+        "lead_status": "processing"
+    }
+    
+    # 1. Validate website
+    if not is_valid_website(website):
+        print(f"[Pipeline] SKIP {business_name} - No valid website", flush=True)
+        lead["lead_status"] = "skipped_no_website"
+        return lead
+    
+    print(f"[Pipeline] Processing: {business_name} ({website})", flush=True)
+    
+    # 2. Scrape website (multi-page)
+    try:
+        scrape_result = await scrape_website_multi_page(website, max_pages=5)
+        
+        if not scrape_result.get("success"):
+            print(f"[Pipeline] SKIP {business_name} - Scraping failed", flush=True)
+            lead["lead_status"] = "skipped_scrape_failed"
+            return lead
+    except Exception as e:
+        print(f"[Pipeline] SKIP {business_name} - Scrape error: {e}", flush=True)
+        lead["lead_status"] = "skipped_scrape_error"
+        return lead
+    
+    # 3 & 4. Enrichment (Layer 1 + Layer 2)
+    try:
+        enrichment = await enrich_lead(scrape_result, business_name, skip_llm=skip_llm)
+        
+        # Merge enrichment data
+        lead.update({
+            "email": enrichment.get("email"),
+            "secondary_email": enrichment.get("secondary_email"),
+            "phone": lead["phone"] or enrichment.get("phone"),  # Apify is source of truth, fallback to scraper
+            "business_summary": enrichment.get("business_summary", ""),
+            "hooks": enrichment.get("hooks", ""),
+            "instagram": enrichment.get("instagram"),
+            "facebook": enrichment.get("facebook"),
+            "linkedin": enrichment.get("linkedin"),
+            "x": enrichment.get("x"),
+            "additional_contact_form": enrichment.get("additional_contact_form"),
+            "founder": enrichment.get("founder")
+        })
+        
+    except Exception as e:
+        print(f"[Pipeline] Enrichment error for {business_name}: {e}", flush=True)
+    
+    # 5. Fallback search if email still missing
+    if not lead["email"]:
+        print(f"[Pipeline] Fallback search for {business_name}...", flush=True)
+        try:
+            fallback = search_for_contact_info(business_name, city)
+            if fallback.get("email"):
+                lead["email"] = fallback["email"]
+                print(f"[Pipeline] Found email via DuckDuckGo: {lead['email']}", flush=True)
+        except Exception as e:
+            print(f"[Pipeline] Fallback search error: {e}", flush=True)
+    
+    # 6. Final status
+    if lead["email"]:
+        lead["lead_status"] = "success"
+        print(f"[Pipeline] SUCCESS {business_name} | Email: {lead['email']}", flush=True)
+    else:
+        lead["lead_status"] = "skipped_no_email"
+        print(f"[Pipeline] PARTIAL {business_name} | No email found", flush=True)
+    
+    return lead
+
+async def run_pipeline(
+    categories: List[str], 
+    locations: List[str], 
+    max_leads: int, 
+    sheet_name: str = None, 
+    sheet_url: str = None,
+    skip_llm: bool = False,
+    shutdown_check: callable = None
+):
+    """
+    Main pipeline orchestrator.
+    
+    Args:
+        categories: List of business categories to search
+        locations: List of locations to search
+        max_leads: Maximum leads to process
+        sheet_name: Optional sheet name
+        sheet_url: Optional existing sheet URL
+        skip_llm: If True, skip LLM enrichment for fast testing
+        shutdown_check: Optional callable that returns True if shutdown requested
+    """
+    print("=" * 60, flush=True)
+    print("GMatrix V2 Pipeline Starting", flush=True)
+    print(f"Categories: {categories}", flush=True)
+    print(f"Locations: {locations}", flush=True)
+    print(f"Max Leads: {max_leads}", flush=True)
+    print(f"Skip LLM: {skip_llm}", flush=True)
+    print("=" * 60, flush=True)
+    
+    # Calculate leads per location and safety factor
+    num_locations = len(locations)
+    num_categories = len(categories)
+    target_leads_per_location = max(1, max_leads // num_locations)
+    
+    # Safety factor: 1.5x to account for:
+    # - Duplicates across categories (~10%)
+    # - No valid website (~20%)
+    # - Scraping failures/no email (~20%)
+    SAFETY_FACTOR = 1.5
+    max_places_per_term = max(1, int((target_leads_per_location / num_categories) * SAFETY_FACTOR))
+    
+    print(f"\n[Config] Target: {target_leads_per_location} leads per location", flush=True)
+    print(f"[Config] Fetching: {max_places_per_term} places per category (1.5x safety factor)\n", flush=True)
+
+    # --- Relevance Guard Setup (Phase 1) ---
+    print(f"\n[Relevance Guard] Initializing Batch Validator for: {categories}...", flush=True)
+    relevance_validator = BatchRelevanceValidator()
+    relevance_audit_log = []
+    skipped_existing_log = []
+    # ----------------------------
+    
+    # --- Enrichment Guard Setup ---
+    enrichment_guard = None
+    if sheet_url:
+        existing_leads = fetch_existing_lead_identifiers(sheet_url)
+        enrichment_guard = EnrichmentGuard(existing_leads)
+    else:
+        print("[Enrichment Guard] No sheet URL - guard disabled.", flush=True)
+    # ----------------------------
+    
+    all_leads = []
+    
+    # Process each location (batch all categories per location)
+    for location in locations:
+        print(f"\n{'='*60}", flush=True)
+        print(f"[Discovery] Location: '{location}'", flush=True)
+        print(f"[Discovery] Categories: {categories}", flush=True)
+        print(f"{'='*60}\n", flush=True)
+        
+        # 1. Fetch from Apify (batched by location)
+        try:
+            raw_leads = fetch_leads_batch(categories, location, max_places_per_term)
+            print(f"[Discovery] Found {len(raw_leads)} raw results from Apify", flush=True)
+        except Exception as e:
+            print(f"[Discovery] ERROR: {e}\n", flush=True)
+            continue
+        
+        if not raw_leads:
+            print(f"[Discovery] No leads found for {location}, skipping...\n", flush=True)
+            continue
+        
+        # 2. Deduplicate by placeId or url
+        seen_ids = set()
+        deduplicated_leads = []
+        for lead in raw_leads:
+            # Use placeId as primary identifier, fallback to url
+            lead_id = lead.get('placeId') or lead.get('url') or lead.get('cid')
+            if lead_id and lead_id not in seen_ids:
+                seen_ids.add(lead_id)
+                deduplicated_leads.append(lead)
+        
+        print(f"[Discovery] After deduplication: {len(deduplicated_leads)} unique places", flush=True)
+        
+        # 3. Trim to target if we have excess
+        if len(deduplicated_leads) > target_leads_per_location:
+            deduplicated_leads = deduplicated_leads[:target_leads_per_location]
+            print(f"[Discovery] Trimmed to target: {len(deduplicated_leads)} places\n", flush=True)
+        
+        # 4. Process leads concurrently (high concurrency for speed)
+        batch_size = 40  # Optimized for LLM context window
+        for i in range(0, len(deduplicated_leads), batch_size):
+            # Shutdown check between batches
+            if shutdown_check and shutdown_check():
+                print("\n[Pipeline] Shutdown requested. Stopping batch processing...", flush=True)
+                break
+                
+            batch = deduplicated_leads[i:i+batch_size]
+            print(f"[Batch] Processing {len(batch)} leads...", flush=True)
+            
+            # Step 1: Pre-filter with Enrichment Guard and collect for Relevance Guard
+            leads_for_relevance = []
+            lead_map = {}  # Map lead_id to raw_lead
+            
+            for raw_lead in batch:
+                category = raw_lead.get('categoryName', categories[0])
+                business_name = raw_lead.get('title', 'Unknown')
+                lead_id = raw_lead.get('placeId') or raw_lead.get('url') or business_name
+                
+                # --- Enrichment Guard Check (before expensive processing) ---
+                if enrichment_guard:
+                    is_dup, dup_reason = enrichment_guard.is_duplicate(raw_lead)
+                    if is_dup:
+                        print(f"[Enrichment Guard] SKIP: '{business_name}' ({dup_reason})", flush=True)
+                        skipped_existing_log.append({
+                            "timestamp": datetime.now().isoformat(),
+                            "business_name": business_name,
+                            "category": category,
+                            "reason": dup_reason
+                        })
+                        continue  # SKIP - already in sheet
+                # ----------------------------
+                
+                leads_for_relevance.append((lead_id, business_name, category))
+                lead_map[lead_id] = raw_lead
+            
+            # Step 2: Batch Relevance Guard Check (Phase 2: efficient LLM batching)
+            if leads_for_relevance:
+                # Use the primary search term (first category) for relevance checking
+                search_term = categories[0]
+                
+                # Convert list of tuples to list of dicts for the validator
+                validator_input = [
+                    {"id": lid, "name": name, "category": cat} 
+                    for lid, name, cat in leads_for_relevance
+                ]
+                
+                relevance_results = relevance_validator.validate_leads(validator_input, search_term)
+                
+                tasks = []
+                for lead_id, business_name, category in leads_for_relevance:
+                    result = relevance_results.get(lead_id)
+                    if not result:
+                         # key might be string vs something else, but we ensured string in service
+                        continue
+                    
+                    relevance_audit_log.append({
+                        "timestamp": datetime.now().isoformat(),
+                        "business_name": business_name,
+                        "category": category,
+                        "status": result.status,
+                        "source": result.source,
+                        "reason": result.reason,
+                        "confidence": result.confidence
+                    })
+                    
+                    if result.status == "REJECT":
+                        print(f"[Relevance Guard] REJECT: '{business_name}' | {result.source}: {result.reason}", flush=True)
+                        continue  # SKIP - irrelevant lead
+                    
+                    # PASS - proceed to processing
+                    print(f"[Relevance Guard] PASS: '{business_name}' | {result.source}: {result.reason}", flush=True)
+                    tasks.append(process_lead(lead_map[lead_id], category, skip_llm=skip_llm))
+                
+                batch_results = await asyncio.gather(*tasks)
+                all_leads.extend(batch_results)
+        
+        if shutdown_check and shutdown_check():
+            break
+    
+    # 3. Save to Google Sheet
+    print(f"\n{'='*60}", flush=True)
+    print(f"[Save] Total leads processed: {len(all_leads)}", flush=True)
+    
+    # Filter: only save successful or partial leads
+    leads_to_save = [
+        lead for lead in all_leads 
+        if lead["lead_status"] in ["success"]
+    ]
+    
+    print(f"[Save] Leads to save: {len(leads_to_save)}", flush=True)
+    print(f"{'='*60}\n", flush=True)
+    
+    if not leads_to_save:
+        print("[Save] No leads to save. Pipeline complete.\n", flush=True)
+        return
+    
+    # Generate sheet name
+    if not sheet_name:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H-%M")
+        cat_str = categories[0] if len(categories) == 1 else f"{len(categories)} categories"
+        sheet_name = f"Israeli Leads - {cat_str} - {timestamp}"
+    
+    try:
+        append_leads_to_sheet(sheet_name, leads_to_save, folder_id=FOLDER_ID, sheet_url=sheet_url)
+        print(f"\n[Done] Pipeline complete! Sheet: {sheet_name if not sheet_url else sheet_url}\n", flush=True)
+    except Exception as e:
+        print(f"\n[Error] Failed to save to Google Sheet: {e}\n", flush=True)
+
+    # --- Save Relevance Audit Log ---
+    if relevance_audit_log:
+        try:
+            with open("relevance_audit.csv", "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["timestamp", "business_name", "category", "status", "source", "reason", "confidence"])
+                writer.writeheader()
+                writer.writerows(relevance_audit_log)
+            print(f"[Audit] Saved {len(relevance_audit_log)} relevance decisions to relevance_audit.csv", flush=True)
+        except Exception as e:
+            print(f"[Audit] Error saving relevance log: {e}", flush=True)
+
+    # --- End-of-Run Enrichment Guard Metrics ---
+    skipped_existing_count = len(skipped_existing_log)
+    if skipped_existing_count > 0:
+        print(f"\n{'='*60}", flush=True)
+        print(f"[Enrichment Guard] End-of-Run Metrics", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"  SKIPPED_EXISTING: {skipped_existing_count}", flush=True)
+        # Breakdown by reason
+        reason_counts = {}
+        for entry in skipped_existing_log:
+            r = entry.get("reason", "unknown")
+            reason_counts[r] = reason_counts.get(r, 0) + 1
+        for reason, count in reason_counts.items():
+            print(f"    - {reason}: {count}", flush=True)
+        print(f"{'='*60}", flush=True)
+    
+    # --- End-of-Run Relevance Guard Metrics ---
+    if relevance_audit_log:
+        total_evaluated = len(relevance_audit_log)
+        pass_count = sum(1 for e in relevance_audit_log if e["status"] == "PASS")
+        reject_count = sum(1 for e in relevance_audit_log if e["status"] == "REJECT")
+        
+        print(f"\n{'='*60}", flush=True)
+        print(f"[Relevance Guard] End-of-Run Metrics", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"  Total Evaluated:  {total_evaluated}", flush=True)
+        print(f"  PASS:             {pass_count} ({100*pass_count/total_evaluated:.1f}%)" if total_evaluated > 0 else "  PASS:             0", flush=True)
+        print(f"  REJECT:           {reject_count} ({100*reject_count/total_evaluated:.1f}%)" if total_evaluated > 0 else "  REJECT:           0", flush=True)
+        print(f"  Source: HEURISTIC {sum(1 for e in relevance_audit_log if e['source'] == 'HEURISTIC')}", flush=True)
+        print(f"  Source: LLM       {sum(1 for e in relevance_audit_log if e['source'] == 'LLM')}", flush=True)
+        print(f"{'='*60}\n", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="GMatrix V2 - Israeli Lead Gen Pipeline")
+    parser.add_argument(
+        "--categories",
+        required=True,
+        help="Comma-separated Hebrew business categories (e.g., 'משרד עורכי דין,חדר כושר')"
+    )
+    parser.add_argument(
+        "--locations",
+        required=True,
+        help="Comma-separated locations (e.g., 'תל אביב,ירושלים')"
+    )
+    parser.add_argument(
+        "--max-leads",
+        type=int,
+        required=True,
+        help="Total number of leads to generate"
+    )
+    parser.add_argument(
+        "--sheet-name",
+        default=None,
+        help="Optional: Custom Google Sheet name"
+    )
+    
+    parser.add_argument(
+        "--sheet-url",
+        default=None,
+        help="Optional: URL of existing Google Sheet"
+    )
+    
+    args = parser.parse_args()
+    
+    # Parse comma-separated inputs
+    categories = [cat.strip() for cat in args.categories.split(",")]
+    locations = [loc.strip() for loc in args.locations.split(",")]
+    
+    # Windows async fix
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    # Run pipeline
+    asyncio.run(run_pipeline(categories, locations, args.max_leads, args.sheet_name, args.sheet_url))
+
+if __name__ == "__main__":
+    main()
