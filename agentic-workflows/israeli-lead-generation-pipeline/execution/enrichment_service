@@ -1,0 +1,428 @@
+import os
+import json
+import re
+from typing import Dict, Optional, List
+from bs4 import BeautifulSoup
+import openai
+from dotenv import load_dotenv
+
+from utils import (
+    extract_all_emails,
+    rank_emails, 
+    extract_phone_from_text,
+    clean_text,
+    truncate_for_llm
+)
+
+# ============================================================
+# SOCIAL LINKS & CONTACT FORM EXTRACTION
+# ============================================================
+
+def extract_social_links(html: str) -> Dict[str, Optional[str]]:
+    """Extract social media links from HTML."""
+    socials = {
+        "instagram": None,
+        "facebook": None,
+        "linkedin": None,
+        "x": None
+    }
+    
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href'].lower()
+            
+            if 'instagram.com' in href and not socials['instagram']:
+                socials['instagram'] = href
+            elif 'facebook.com' in href and not socials['facebook']:
+                socials['facebook'] = href
+            elif 'linkedin.com' in href and not socials['linkedin']:
+                socials['linkedin'] = href
+            elif ('twitter.com' in href or 'x.com' in href) and not socials['x']:
+                socials['x'] = href
+        
+    except Exception as e:
+        print(f"[Enrichment] Error extracting social links: {e}", flush=True)
+    
+    return socials
+
+def find_contact_form(html: str, base_url: str) -> Optional[str]:
+    """Try to find a contact form URL."""
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        for form in soup.find_all('form'):
+            form_id = form.get('id', '').lower()
+            form_class = ' '.join(form.get('class', [])).lower()
+            
+            if any(keyword in form_id or keyword in form_class 
+                   for keyword in ['contact', 'צור קשר', 'יצירת קשר']):
+                return base_url
+        
+    except Exception:
+        pass
+    
+    return None
+
+# ============================================================
+# STEP A: PRE-LLM CONTENT GATE
+# ============================================================
+
+# Patterns to remove (navigation, footers, boilerplate)
+NOISE_PATTERNS = [
+    r'(?i)skip to content',
+    r'(?i)cookie policy',
+    r'(?i)privacy policy',
+    r'(?i)terms of service',
+    r'(?i)all rights reserved',
+    r'(?i)© \d{4}',
+    r'(?i)powered by',
+    r'(?i)built with',
+    r'(?i)designed by',
+    r'(?i)follow us on',
+    r'(?i)subscribe to our',
+    r'(?i)newsletter',
+    r'(?i)login|sign in|sign up',
+    r'(?i)cart|checkout|add to cart',
+    r'(?i)search\.\.\.?',
+    r'\[.*?\]\(.*?\)',  # Markdown links
+    r'#{1,6}\s*(menu|navigation|footer|header|sidebar)',
+]
+
+# Hebrew boilerplate
+HEBREW_NOISE = [
+    r'כל הזכויות שמורות',
+    r'מדיניות פרטיות',
+    r'תנאי שימוש',
+    r'הרשמה לניוזלטר',
+    r'עקבו אחרינו',
+    r'צור קשר',  # When repeated as navigation
+]
+
+def clean_content_for_llm(markdown: str) -> str:
+    """
+    Light content cleaning: remove navigation, footers, repeated boilerplate.
+    Returns cleaned text ready for LLM.
+    """
+    if not markdown:
+        return ""
+    
+    text = markdown
+    
+    # Remove noise patterns
+    for pattern in NOISE_PATTERNS + HEBREW_NOISE:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+    
+    # Remove excessive whitespace and empty lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r' {2,}', ' ', text)
+    
+    # Remove very short lines (likely navigation items)
+    lines = text.split('\n')
+    filtered_lines = [
+        line for line in lines 
+        if len(line.strip()) > 15 or not line.strip()  # Keep empty or substantial lines
+    ]
+    text = '\n'.join(filtered_lines)
+    
+    return text.strip()
+
+def count_informational_sentences(text: str) -> int:
+    """
+    Count unique informational sentences.
+    Skip short phrases, navigation items, and repeated content.
+    """
+    if not text:
+        return 0
+    
+    # Split into sentences (Hebrew and English)
+    sentences = re.split(r'[.!?。]', text)
+    
+    # Filter for informational sentences
+    seen = set()
+    count = 0
+    
+    for sentence in sentences:
+        sentence = sentence.strip()
+        
+        # Skip too short
+        if len(sentence) < 30:
+            continue
+        
+        # Skip if looks like navigation/slogan
+        if len(sentence.split()) < 5:
+            continue
+        
+        # Skip duplicates
+        normalized = sentence.lower()[:50]
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        
+        count += 1
+    
+    return count
+
+def evaluate_content_quality(markdown: str) -> tuple[bool, str]:
+    """
+    Evaluate if content has enough signal for LLM summarization.
+    
+    Returns: (should_proceed, reason)
+    """
+    if not markdown:
+        return False, "no content"
+    
+    cleaned = clean_content_for_llm(markdown)
+    sentence_count = count_informational_sentences(cleaned)
+    word_count = len(cleaned.split())
+    
+    # Thresholds
+    MIN_SENTENCES = 5
+    MIN_WORDS = 100
+    
+    if sentence_count < MIN_SENTENCES:
+        return False, f"insufficient content ({sentence_count} sentences)"
+    
+    if word_count < MIN_WORDS:
+        return False, f"content too thin ({word_count} words)"
+    
+    return True, f"ok ({sentence_count} sentences, {word_count} words)"
+
+# ============================================================
+# STEP B: LLM SUMMARIZATION PROMPT
+# ============================================================
+
+
+SYSTEM_PROMPT = """You are an expert researcher. Your goal is to analyze business websites and produce factual, neutral content for cold outreach.
+
+Output language: Hebrew only.
+Tone: Strictly neutral, factual, and professional. NO marketing fluff, NO adjectives like "leading", "top", "premier".
+
+RULES for SUMMARY:
+1. Comprehensive yet concise.
+2. Cover: What they do, Who they serve, Main areas of focus.
+3. NO conclusions or recommendations.
+
+RULES for HOOKS (Pitch Atoms):
+1. Create 2-3 distinct, neutral observations based on the website.
+2. These act as cold outreach openers (e.g., "I noticed you specialize in X...").
+3. DO NOT offer advice or point out gaps.
+4. DO NOT use generic phrases. Be specific to this business.
+5. One sentence per hook.
+"""
+
+USER_PROMPT_TEMPLATE = """Analyze this business website and produce:
+
+1. SUMMARY (Hebrew):
+   - A descriptive, factual summary of the business.
+   - 2 paragraphs that clearly explain their services, target audience, and specialty areas.
+   - Avoid marketing language entirely.
+
+2. HOOKS (Hebrew):
+   - 2-3 neutral observations about the business.
+   - Format: Simple sentences ready for a cold email opener.
+   - Example: "ראיתי שבאתר שלכם אתם מתמקדים בייצוג חברות סטארט-אפ..."
+   - NO prefixes, NO bullet points in the text.
+
+Business name: {business_name}
+
+Website content:
+{content}
+
+Output valid JSON:
+{{
+  "summary_p1": "Paragraph 1 content...",
+  "summary_p2": "Paragraph 2 content...",
+  "hooks": [
+    "Observation sentence 1...",
+    "Observation sentence 2...",
+    "Observation sentence 3 (optional)"
+  ],
+  "hooks_available": true // or false if content is insufficient
+}}"""
+
+
+# ============================================================
+# LAYER 1: CONTACT & SIGNALS EXTRACTION
+# ============================================================
+
+def layer_1_enrichment(scrape_result: dict) -> dict:
+    """
+    Layer 1: Contact & Signals Extraction (Heuristic/Regex)
+    """
+    full_html = scrape_result.get("full_html", "")
+    full_markdown = scrape_result.get("full_markdown", "")
+    homepage_url = scrape_result.get("homepage_url", "")
+    
+    result = {
+        "emails": [],
+        "primary_email": None,
+        "secondary_email": None,
+        "phone": None,
+        "socials": {
+            "instagram": None,
+            "facebook": None,
+            "linkedin": None,
+            "x": None
+        },
+        "contact_form": None,
+        "cleaned_content": "",
+        "content_quality": (False, "")
+    }
+    
+    # Extract emails
+    all_emails = extract_all_emails(full_html, full_markdown)
+    result["emails"] = all_emails
+    
+    primary, secondary = rank_emails(all_emails, homepage_url)
+    result["primary_email"] = primary
+    result["secondary_email"] = secondary
+    
+    # Extract phone
+    result["phone"] = extract_phone_from_text(full_markdown)
+    
+    # Extract social links
+    result["socials"] = extract_social_links(full_html)
+    
+    # Check for contact form
+    result["contact_form"] = find_contact_form(full_html, homepage_url)
+    
+    # STEP A: Pre-LLM Content Gate
+    cleaned = clean_content_for_llm(full_markdown)
+    result["cleaned_content"] = cleaned
+    result["content_quality"] = evaluate_content_quality(full_markdown)
+    
+    should_proceed, quality_reason = result["content_quality"]
+    print(f"[L1] Emails: {len(all_emails)}, Content: {quality_reason}", flush=True)
+    
+    return result
+
+# ============================================================
+# LAYER 2: LLM SUMMARIZATION
+# ============================================================
+
+async def layer_2_enrichment(scrape_result: dict, business_name: str, l1_result: dict) -> dict:
+    """
+    Layer 2: LLM Content Summarization
+    
+    Single LLM call. No retries. Returns structured summary.
+    """
+    result = {
+        "business_summary": None,
+        "hooks": [],
+        "founder": None
+    }
+    
+    # Check content gate
+    should_proceed, reason = l1_result.get("content_quality", (False, "unknown"))
+    
+    if not should_proceed:
+        print(f"[L2] Skipping LLM - {reason}", flush=True)
+        return result
+    
+    cleaned_content = l1_result.get("cleaned_content", "")
+    if not cleaned_content:
+        print(f"[L2] Skipping LLM - no cleaned content", flush=True)
+        return result
+    
+    # Truncate for context window
+    content = truncate_for_llm(cleaned_content, max_chars=30000)
+    
+    load_dotenv()
+    client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": USER_PROMPT_TEMPLATE.format(
+                    business_name=business_name,
+                    content=content
+                )}
+            ]
+            # Note: temperature removed - GPT-5 mini only supports default (1)
+        )
+        
+        data = json.loads(response.choices[0].message.content)
+        
+        # Combine two paragraphs into single summary
+        p1 = data.get("summary_p1", "").strip()
+        p2 = data.get("summary_p2", "").strip()
+        
+        if p1 and p2:
+            result["business_summary"] = f"{p1}\n\n{p2}"
+        elif p1:
+            result["business_summary"] = p1
+        
+        # Parse Hooks (Pitch Atoms)
+        hooks_available = data.get("hooks_available", False)
+        hooks_data = data.get("hooks", [])
+        
+        formatted_hooks = []
+        
+        if hooks_available and isinstance(hooks_data, list):
+            # Clean and filter hooks
+            for hook in hooks_data:
+                if not isinstance(hook, str):
+                    continue
+                
+                clean_hook = hook.strip()
+                if len(clean_hook) > 10:  # Minimum length check
+                    formatted_hooks.append(clean_hook)
+        
+        # Join into single string with DOUBLE NEWLINE for clear separation in calls/emails
+        result["hooks"] = "\n\n".join(formatted_hooks) if formatted_hooks else None
+        result["founder"] = data.get("founder")
+        
+        summary_len = len(result["business_summary"]) if result["business_summary"] else 0
+        print(f"[L2] Summary: {summary_len} chars, Hooks: {len(formatted_hooks)}", flush=True)
+        
+    except Exception as e:
+        print(f"[L2] LLM Error: {e}", flush=True)
+    
+    finally:
+        # CRITICAL: Close the async client to prevent resource leaks
+        await client.close()
+    
+    return result
+
+# ============================================================
+# MAIN ENRICHMENT FUNCTION
+# ============================================================
+
+async def enrich_lead(scrape_result: dict, business_name: str, skip_llm: bool = False) -> dict:
+    """
+    Complete enrichment pipeline: Layer 1 + Layer 2
+    """
+    # Layer 1: Extract contacts and signals
+    l1 = layer_1_enrichment(scrape_result)
+    
+    # Layer 2: LLM content understanding
+    if not skip_llm:
+        l2 = await layer_2_enrichment(scrape_result, business_name, l1)
+    else:
+        l2 = {
+            "business_summary": "[SKIPPED] Test mode",
+            "hooks": [],
+            "founder": None
+        }
+    
+    # Combine
+    enriched = {
+        "email": l1["primary_email"],
+        "secondary_email": l1["secondary_email"],
+        "phone": l1["phone"],
+        "instagram": l1["socials"]["instagram"],
+        "facebook": l1["socials"]["facebook"],
+        "linkedin": l1["socials"]["linkedin"],
+        "x": l1["socials"]["x"],
+        "additional_contact_form": l1["contact_form"],
+        "business_summary": l2["business_summary"],
+        "hooks": l2["hooks"],  # Already formatted as string in layer_2_enrichment
+        "founder": l2["founder"]
+    }
+    
+    return enriched
