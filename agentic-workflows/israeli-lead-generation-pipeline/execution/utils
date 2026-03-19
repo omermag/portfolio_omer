@@ -1,0 +1,387 @@
+import hashlib
+import re
+from typing import Optional, List, Tuple
+from urllib.parse import urlparse
+
+def generate_lead_id(business_name: str, city: str) -> str:
+    """Generate unique lead ID from business name and city."""
+    name = (business_name or "unknown").lower().strip()
+    loc = (city or "unknown").lower().strip()
+    raw = f"{name}|{loc}"
+    return hashlib.md5(raw.encode('utf-8')).hexdigest()[:16]
+
+def clean_text(text: str) -> str:
+    """Remove excessive whitespace and normalize text."""
+    if not text:
+        return ""
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+# ========== EMAIL EXTRACTION - AGGRESSIVE FILTERING ==========
+
+# System/platform domains to ALWAYS reject
+SYSTEM_DOMAINS = [
+    # Website builders & CMS
+    'wix.com', 'wixpress.com', 'wordpress.com', 'squarespace.com', 'weebly.com',
+    'webflow.com', 'godaddy.com', 'shopify.com', 'wixsite.com',
+    # Error tracking & analytics
+    'sentry.io', 'sentry-next.wixpress.com', 'hotjar.com', 'mixpanel.com',
+    # Design tools
+    'figma.com', 'sketch.com', 'adobe.com', 'canva.com', 
+    # Cloud providers
+    'cloudflare.com', 'amazonaws.com', 'azure.com', 'googlecloud.com',
+    # Social platforms
+    'facebook.com', 'instagram.com', 'twitter.com', 'linkedin.com', 'tiktok.com',
+    # Generic
+    'example.com', 'test.com', 'localhost', 'temp.com', 'dummy.com',
+    # Email providers (for no-reply addresses)
+    'mailchimp.com', 'sendgrid.com', 'mailgun.com', 'constantcontact.com',
+]
+
+# Patterns that indicate a non-email (image files, placeholders)
+INVALID_EMAIL_PATTERNS = [
+    r'@2x\.',           # image@2x.png
+    r'@3x\.',           # image@3x.png  
+    r'\.png$',          # ends with .png
+    r'\.jpg$',          # ends with .jpg
+    r'\.jpeg$',         # ends with .jpeg
+    r'\.svg$',          # ends with .svg
+    r'\.gif$',          # ends with .gif
+    r'\.webp$',         # ends with .webp
+    r'^asset',          # asset-13@4x-8.png
+    r'^image',          # image@domain
+    r'^icon',           # icon@domain
+    r'^logo',           # logo@domain
+]
+
+# Placeholder patterns - emails that are clearly templates/examples
+PLACEHOLDER_PATTERNS = [
+    r'^your',           # yourname@, youremail@
+    r'^my',             # myemail@, myname@
+    r'^name@',          # name@domain
+    r'^email@',         # email@domain
+    r'^user@',          # user@domain
+    r'^admin@example',  # admin@example
+    r'^test@',          # test@domain
+    r'^demo@',          # demo@domain
+    r'@yourdomain',     # anything@yourdomain.com
+    r'@domain\.com$',   # anything@domain.com
+    r'@example',        # anything@example.com
+]
+
+# Prefixes that indicate system/no-reply emails
+NOREPLY_PREFIXES = [
+    'no-reply', 'noreply', 'no_reply', 'donotreply', 'do-not-reply',
+    'mailer-daemon', 'postmaster', 'bounce', 'unsubscribe',
+    'notifications', 'notification', 'alert', 'alerts',
+    'system', 'automated', 'auto-', 'robot',
+]
+
+def is_system_email(email: str) -> bool:
+    """Check if email belongs to a system/platform domain."""
+    email_lower = email.lower()
+    domain = email_lower.split('@')[-1] if '@' in email_lower else ''
+    
+    for sys_domain in SYSTEM_DOMAINS:
+        if sys_domain in domain:
+            return True
+    return False
+
+def is_invalid_pattern(email: str) -> bool:
+    """Check if email matches invalid patterns (images, assets)."""
+    email_lower = email.lower()
+    
+    for pattern in INVALID_EMAIL_PATTERNS:
+        if re.search(pattern, email_lower):
+            return True
+    return False
+
+def is_placeholder_email(email: str) -> bool:
+    """Check if email is a placeholder/template."""
+    email_lower = email.lower()
+    
+    for pattern in PLACEHOLDER_PATTERNS:
+        if re.search(pattern, email_lower):
+            return True
+    return False
+
+def is_noreply_email(email: str) -> bool:
+    """Check if email is a no-reply/system address."""
+    email_lower = email.lower()
+    local_part = email_lower.split('@')[0] if '@' in email_lower else email_lower
+    
+    for prefix in NOREPLY_PREFIXES:
+        if prefix in local_part:
+            return True
+    return False
+
+def is_valid_email(email: str) -> bool:
+    """Comprehensive validation - returns True only for real business emails."""
+    if not email or '@' not in email:
+        return False
+    
+    email = email.strip().lower()
+    
+    # Length checks
+    if len(email) < 5 or len(email) > 254:
+        return False
+    
+    # Must have valid structure
+    if email.count('@') != 1:
+        return False
+    
+    local, domain = email.split('@')
+    if not local or not domain or '.' not in domain:
+        return False
+    
+    # Apply all filters
+    if is_system_email(email):
+        return False
+    if is_invalid_pattern(email):
+        return False
+    if is_placeholder_email(email):
+        return False
+    if is_noreply_email(email):
+        return False
+    
+    return True
+
+def extract_mailto_emails(html: str) -> List[str]:
+    """Extract emails from mailto: links - most reliable source."""
+    if not html:
+        return []
+    
+    # Pattern: href="mailto:email@domain.com" or href='mailto:...'
+    pattern = r'href=["\']mailto:([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})["\']'
+    emails = re.findall(pattern, html, re.IGNORECASE)
+    
+    # Also handle mailto: without quotes
+    pattern2 = r'mailto:([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})'
+    emails.extend(re.findall(pattern2, html, re.IGNORECASE))
+    
+    return [e.lower() for e in set(emails) if is_valid_email(e)]
+
+def extract_obfuscated_emails(text: str) -> List[str]:
+    """Extract obfuscated emails like 'name [at] domain [dot] com'."""
+    if not text:
+        return []
+    
+    emails = []
+    
+    # Pattern variations for obfuscated emails
+    obfuscation_patterns = [
+        # name [at] domain [dot] com
+        r'([A-Za-z0-9._%+-]+)\s*\[at\]\s*([A-Za-z0-9.-]+)\s*\[dot\]\s*([A-Za-z]{2,})',
+        # name (at) domain (dot) com
+        r'([A-Za-z0-9._%+-]+)\s*\(at\)\s*([A-Za-z0-9.-]+)\s*\(dot\)\s*([A-Za-z]{2,})',
+        # name [at] domain.com
+        r'([A-Za-z0-9._%+-]+)\s*\[at\]\s*([A-Za-z0-9.-]+\.[A-Za-z]{2,})',
+        # name (at) domain.com  
+        r'([A-Za-z0-9._%+-]+)\s*\(at\)\s*([A-Za-z0-9.-]+\.[A-Za-z]{2,})',
+        # name AT domain DOT com (uppercase)
+        r'([A-Za-z0-9._%+-]+)\s+AT\s+([A-Za-z0-9.-]+)\s+DOT\s+([A-Za-z]{2,})',
+    ]
+    
+    for pattern in obfuscation_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            if len(match) == 3:
+                email = f"{match[0]}@{match[1]}.{match[2]}"
+            else:
+                email = f"{match[0]}@{match[1]}"
+            
+            email = email.lower().strip()
+            if is_valid_email(email):
+                emails.append(email)
+    
+    return list(set(emails))
+
+def extract_emails_from_text(text: str) -> List[str]:
+    """Extract email addresses using regex with aggressive filtering."""
+    if not text:
+        return []
+    
+    # Standard email regex
+    pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
+    raw_emails = re.findall(pattern, text, re.IGNORECASE)
+    
+    # Filter and validate each email
+    valid_emails = [
+        email.lower() for email in raw_emails 
+        if is_valid_email(email)
+    ]
+    
+    return list(set(valid_emails))
+
+def extract_all_emails(html: str, markdown: str) -> List[str]:
+    """
+    Extract emails from all sources with priority:
+    1. mailto: links (highest confidence)
+    2. Obfuscated emails
+    3. Standard regex extraction
+    """
+    all_emails = []
+    
+    # 1. mailto: links (most reliable)
+    mailto_emails = extract_mailto_emails(html)
+    all_emails.extend(mailto_emails)
+    
+    # 2. Obfuscated emails
+    obfuscated = extract_obfuscated_emails(markdown)
+    all_emails.extend(obfuscated)
+    
+    # 3. Standard extraction from both HTML and markdown
+    html_emails = extract_emails_from_text(html)
+    markdown_emails = extract_emails_from_text(markdown)
+    all_emails.extend(html_emails)
+    all_emails.extend(markdown_emails)
+    
+    # Deduplicate while preserving order (mailto first)
+    seen = set()
+    unique = []
+    for email in all_emails:
+        if email not in seen:
+            seen.add(email)
+            unique.append(email)
+    
+    return unique
+
+def score_email(email: str, website_domain: str = None) -> int:
+    """
+    Score email quality for prioritization. Higher = better.
+    
+    Priority:
+    1. info@/contact@ on business domain (100)
+    2. Other business domain emails (90)
+    3. office@/sales@ (85)
+    4. Gmail/Outlook if clearly contact (50)
+    5. Other (30)
+    """
+    email = email.lower()
+    
+    # Final validation
+    if not is_valid_email(email):
+        return 0
+    
+    local_part = email.split('@')[0]
+    domain = email.split('@')[1]
+    
+    # Check if email domain matches website domain
+    is_business_domain = False
+    if website_domain:
+        # Extract domain from website URL
+        try:
+            parsed = urlparse(website_domain if '://' in website_domain else f'https://{website_domain}')
+            site_domain = parsed.netloc.replace('www.', '')
+            if site_domain in domain or domain in site_domain:
+                is_business_domain = True
+        except:
+            pass
+    
+    # Scoring logic
+    if local_part in ['info', 'contact', 'office']:
+        if is_business_domain:
+            return 100  # Best: info@businessdomain.com
+        return 85
+    
+    if local_part in ['sales', 'support', 'hello', 'team']:
+        if is_business_domain:
+            return 95
+        return 80
+    
+    if is_business_domain:
+        return 90  # Any email on business domain is good
+    
+    # Personal email domains
+    personal_domains = ['gmail.com', 'hotmail.com', 'yahoo.com', 'outlook.com', 'walla.com', 'walla.co.il']
+    if any(pd in domain for pd in personal_domains):
+        return 50  # Lower priority but still valid
+    
+    # Israeli business domains
+    if domain.endswith('.co.il') or domain.endswith('.org.il'):
+        return 85
+    
+    return 60  # Default for unknown domains
+
+def rank_emails(emails: List[str], website_url: str = None) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return (primary_email, secondary_email) based on scoring.
+    
+    Primary: Business email (info@, office@, contact@, sales@)
+    Secondary: Personal-style email (Gmail with real name) - optional
+    
+    Both are single strings, not arrays.
+    """
+    if not emails:
+        return None, None
+    
+    # Score and sort
+    scored = [(email, score_email(email, website_url)) for email in emails]
+    scored = [s for s in scored if s[1] > 0]  # Remove invalid
+    scored.sort(key=lambda x: x[1], reverse=True)
+    
+    if not scored:
+        return None, None
+    
+    # Primary: highest scoring email (should be business)
+    primary = scored[0][0]
+    
+    # Secondary: look for a personal email (Gmail/Outlook with real name)
+    # Only if we have more than one email
+    secondary = None
+    if len(scored) > 1:
+        personal_domains = ['gmail.com', 'hotmail.com', 'yahoo.com', 'outlook.com', 'walla.com', 'walla.co.il']
+        for email, score in scored[1:]:
+            domain = email.split('@')[-1].lower()
+            if any(pd in domain for pd in personal_domains):
+                secondary = email
+                break
+        
+        # If no personal found, take second business email
+        if not secondary and len(scored) > 1:
+            secondary = scored[1][0]
+    
+    return primary, secondary
+
+# ========== OTHER UTILITIES ==========
+
+def extract_phone_from_text(text: str) -> Optional[str]:
+    """Extract Israeli phone number from text."""
+    if not text:
+        return None
+    
+    patterns = [
+        r'0[0-9]{1,2}[-\s]?[0-9]{7}',
+        r'\+972[-\s]?[0-9]{1,2}[-\s]?[0-9]{7}',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            phone = match.group(0)
+            phone = re.sub(r'[-\s]', '', phone)
+            return phone
+    
+    return None
+
+def is_valid_website(url: str) -> bool:
+    """Basic validation for website URL."""
+    if not url:
+        return False
+    
+    url_lower = url.lower()
+    
+    if not (url_lower.startswith('http://') or url_lower.startswith('https://')):
+        return False
+    
+    excluded = ['facebook.com', 'linkedin.com', 'instagram.com', 'twitter.com']
+    if any(exc in url_lower for exc in excluded):
+        return False
+    
+    return True
+
+def truncate_for_llm(text: str, max_chars: int = 40000) -> str:
+    """Truncate text to fit LLM context window."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[...truncated]"
