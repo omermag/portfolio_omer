@@ -1,0 +1,207 @@
+// main.optimized.v2.5.withHeaderScan.js
+// Includes header/nav scanning logic for contact/about/submit links
+import { Actor, log } from 'apify';
+import { PuppeteerCrawler, RequestQueue } from 'crawlee';
+import * as cheerio from 'cheerio';
+
+const EMAIL_REGEX = /\b[a-zA-Z0-9._%+-]{2,}@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/g;
+const FORM_HINT = /form|submit|message|demo|contact|send/i;
+const SOCIAL_KEYS = ['instagram.com', 'facebook.com', 'beatport.com', 'spotify.com', 'soundcloud.com', 'youtube.com', 'trackstack.link', 'linktr.ee', 'linktree.com', 'bandcamp.com', 'tiktok.com', 'x.com', 'threads.net'];
+
+await Actor.init();
+log.info('🚀 Actor initialized');
+
+const input = await Actor.getInput();
+if (!Array.isArray(input)) throw new Error('❌ Input must be an array of entries');
+const entries = input.filter(item => item.url);
+if (!entries.length) throw new Error('❌ No entries with valid URLs');
+
+log.info(`📥 Loaded ${entries.length} entries`);
+
+const queue = await RequestQueue.open();
+const results = [];
+
+for (const item of entries) {
+    let url = item.url;
+    if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+    try { new URL(url); } catch { log.warning(`⚠️ Invalid URL skipped: ${url}`); continue; }
+
+    results.push({
+        id: item.ID,
+        label: item.label,
+        officialWebsite: url,
+        mainText: '',
+        contactPage: null,
+        aboutPage: null,
+        submissionPage: null,
+        contactForm: null,
+        submissionType: null,
+        mailto1: null,
+        mailtoType: null,
+        email1: null,
+        email1Type: null,
+        email2: null,
+        email2Type: null,
+        instagram: null,
+        facebook: null,
+        youtube: null,
+        beatport: null,
+        spotify: null,
+        x:null,
+        soundcloud: null,
+        tiktok: null,
+        linktree: null,
+        bandcamp: null,
+        trackstack: null,
+        submithub: null,
+        labelradar: null,
+        groover: null,
+    });
+
+    await queue.addRequest({ url, userData: { type: 'MAIN', id: item.ID } });
+}
+const crawler = new PuppeteerCrawler({
+    requestQueue: queue,
+    maxConcurrency: 1,
+    launchContext: {
+        launchOptions: { headless: true, args: ['--no-sandbox'] },
+    },
+
+    async requestHandler({ request, page }) {
+        const record = results.find(r => r.id === request.userData.id);
+        if (!record) return;
+
+        log.info(`🌐 Processing [${request.userData.type}] ${request.url}`);
+
+        const html = await page.content();
+        const $ = cheerio.load(html);
+        const baseDomain = new URL(request.url).hostname.replace('www.', '');
+
+        if (request.userData.type === 'MAIN') {
+            $('script, style, noscript, footer, .cookie, .banner, .popup, .modal, .consent, .revisit, .chat, #cookie-law-info-bar').remove();
+
+let mainContent =
+    $('main').text() ||
+    $('section').first().text() ||
+    $('article').first().text() ||
+    $('body').text();
+
+record.mainText = mainContent.replace(/\s+/g, ' ').trim().slice(0, 1000);
+
+        }
+
+        // ---- EMAILS ----
+        const emails = [...html.matchAll(EMAIL_REGEX)].map(m => m[0]).filter(e => e.length < 60);
+        $('a[href^="mailto:"]').each((_, el) => {
+            const mail = $(el).attr('href').replace(/^mailto:/, '').split('?')[0];
+            if (EMAIL_REGEX.test(mail)) emails.push(mail);
+            if (!record.mailto1) record.mailto1 = mail;
+        });
+
+        const classifyEmail = (e) =>
+            /demo/.test(e) ? 'demo' :
+            /contact|reach/.test(e) ? 'contact' :
+            /info|hello/.test(e) ? 'info' : 'other';
+
+        const uniqueEmails = [...new Set(emails)].slice(0, 2);
+        if (uniqueEmails[0]) {
+            record.email1 = uniqueEmails[0];
+            record.email1Type = classifyEmail(uniqueEmails[0]);
+        }
+        if (uniqueEmails[1]) {
+            record.email2 = uniqueEmails[1];
+            record.email2Type = classifyEmail(uniqueEmails[1]);
+        }
+
+        // ---- SOCIAL LINKS ----
+        $('a[href]').each((_, el) => {
+            const href = $(el).attr('href');
+            if (!href) return;
+            try {
+                const fullUrl = new URL(href, request.url);
+                const hostname = fullUrl.hostname.replace('www.', '');
+                if (hostname === baseDomain) return;
+
+                SOCIAL_KEYS.forEach(key => {
+                    if (hostname.includes(key)) {
+                        if (key.includes('instagram') && !record.instagram) record.instagram = fullUrl.href;
+                        else if (key.includes('facebook') && !record.facebook) record.facebook = fullUrl.href;
+                        else if (key.includes('beatport') && !record.beatport) record.beatport = fullUrl.href;
+                         else if (key.includes('youtube') && !record.youtube) record.youtube = fullUrl.href;
+                        else if (key.includes('spotify') && !record.spotify) record.spotify = fullUrl.href;
+                        else if (key.includes('soundcloud') && !record.soundcloud) record.soundcloud = fullUrl.href;
+                        else if ((key.includes('linktr.ee') || key.includes('linktree')) && !record.linktree) record.linktree = fullUrl.href;
+                        else if (key.includes('bandcamp') && !record.bandcamp) record.bandcamp = fullUrl.href;
+                         else if (key.includes('x') && !record.x) record.x = fullUrl.href;
+                       else if (key.includes('tiktok') && !record.tiktok) record.tiktok = fullUrl.href;
+                        else if (key.includes('trackstack') && !record.trackstack) {
+                            record.trackstack = fullUrl.href;
+                            record.contactForm = fullUrl.href;
+                            record.submissionType = 'trackstack';
+                            if (!record.submissionPage) record.submissionPage = fullUrl.href;
+                        }
+                    }
+                });
+
+                const text = $(el).text().toLowerCase();
+                if (/about/.test(href) || /about/.test(text)) record.aboutPage = fullUrl.href;
+                if (/contact/.test(href) || /contact/.test(text)) record.contactPage = fullUrl.href;
+                if (/submit|demo/.test(href) || /submit|demo/.test(text)) {
+                    if (!record.submissionPage) record.submissionPage = fullUrl.href;
+                }
+            } catch {}
+        });
+
+        // ---- HEADER/BUTTON FALLBACK ----
+        $('nav, header, .menu, ul').find('*').each((_, el) => {
+            const text = $(el).text().trim().toLowerCase();
+            const href = $(el).attr('href');
+            if (!href) return;
+            const fullUrl = new URL(href, request.url).href;
+
+            if (!record.contactPage && /contact|get in touch/.test(text)) record.contactPage = fullUrl;
+            if (!record.aboutPage && /about/.test(text)) record.aboutPage = fullUrl;
+            if (!record.submissionPage && /submit|demo/.test(text)) record.submissionPage = fullUrl;
+        });
+
+        // ---- FOLLOWUP SCANS ----
+        if (request.userData.type === 'MAIN') {
+            const nextUrls = new Set([record.contactPage, record.aboutPage, record.submissionPage]);
+            for (const url of nextUrls) {
+                if (url) await queue.addRequest({ url, userData: { type: 'CONTACT', id: record.id } });
+            }
+        }
+
+        // ---- FORM DETECTION ----
+        if (request.userData.type === 'CONTACT') {
+            $('form').each((_, el) => {
+                const outer = $.html(el).toLowerCase();
+                const action = $(el).attr('action');
+                const hasFile = $('input[type="file"]').length > 0;
+                const hasSubmit = $('button, input[type="submit"]').filter((_, el) => {
+                    const text = $(el).text().toLowerCase() + ($(el).attr('value') || '').toLowerCase();
+                    return /submit|send|demo|message/.test(text);
+                }).length > 0;
+
+                if (FORM_HINT.test(outer) || hasFile || hasSubmit) {
+                    if (!record.contactForm) record.contactForm = request.url;
+                    if (!record.submissionType) record.submissionType = 'native';
+                    if (!record.submissionPage) record.submissionPage = request.url;
+                }
+            });
+        }
+
+        log.info(`✅ Finished [${request.userData.type}] ${request.url}`);
+        await new Promise(r => setTimeout(r, 300));
+    },
+
+    failedRequestHandler: async ({ request }) => {
+        log.warning(`❌ Failed request: ${request.url}`);
+    }
+});
+
+await crawler.run();
+log.info('📤 Pushing results to dataset');
+await Actor.pushData(results);
+log.info(`✅ Done. Scraped ${results.length} records`);
+await Actor.exit();
