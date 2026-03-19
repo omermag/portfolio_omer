@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "title": "Beatport Scraper",
+  "type": "object",
+  "properties": {
+    "urls": {
+      "type": "array",
+      "title": "Target URLs",
+      "description": "Enter one Beatport URL per line",
+      "editor": "stringList"
+    }
+  },
+  "required": ["urls"]
+}
