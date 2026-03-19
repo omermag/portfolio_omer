@@ -1,0 +1,147 @@
+import gspread
+from google.oauth2.service_account import Credentials
+from typing import List, Dict
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+def get_gc():
+    """Authenticates with Google Sheets."""
+    creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
+    return gspread.authorize(creds)
+
+def create_sheet_in_folder(sheet_name: str, folder_id: str):
+    """Creates a new sheet inside a specific Drive folder."""
+    gc = get_gc()
+    try:
+        sh = gc.create(sheet_name, folder_id=folder_id)
+        print(f"[Drive] Created sheet '{sheet_name}': {sh.url}", flush=True)
+        return sh.sheet1
+    except Exception as e:
+        print(f"[Drive] Error creating sheet: {e}", flush=True)
+        raise e
+
+def append_leads_to_sheet(sheet_name: str, leads_data: List[Dict], folder_id: str = None, sheet_url: str = None):
+    """
+    Appends leads to a new sheet in the specified folder, or an existing sheet via URL.
+    """
+    if not leads_data:
+        print("[Drive] No leads to append.", flush=True)
+        return
+    
+    # V2 Headers
+    headers = [
+        "lead_id", "business_name", "city", "category", "website", "email",
+        "secondary_email", "phone", "business_summary", "hooks", "instagram",
+        "facebook", "linkedin", "x", "additional_contact_form", "founder", "lead_status"
+    ]
+    
+    ws = None
+    seen_ids = set()
+    
+    if sheet_url:
+        try:
+            gc = get_gc()
+            sh = gc.open_by_url(sheet_url)
+            ws = sh.sheet1
+            print(f"[Drive] Using existing sheet: {sh.title}", flush=True)
+            # Check if headers exist
+            try:
+                first_row = ws.row_values(1)
+                if not first_row:
+                    ws.append_row(headers)
+                else:
+                    # Load existing IDs for basic deduplication
+                    col1 = ws.col_values(1)
+                    seen_ids.update(col1)
+            except:
+                ws.append_row(headers)
+        except Exception as e:
+            print(f"[Drive] Error opening existing sheet: {e}", flush=True)
+            raise e
+    else:
+        ws = create_sheet_in_folder(sheet_name, folder_id)
+        ws.append_row(headers)
+    
+    
+    def safe_str(value):
+        """Safely convert any value to string for Google Sheets."""
+        if value is None:
+            return ''
+        if isinstance(value, list):
+            return ', '.join(str(v) for v in value if v)
+        if isinstance(value, dict):
+            return str(value)
+        return str(value)
+    
+    rows_to_add = []
+    for lead in leads_data:
+        lid = lead.get('lead_id', '')
+        if lid in seen_ids:
+            continue
+        seen_ids.add(lid)
+        
+        row = [
+            safe_str(lid),
+            safe_str(lead.get('business_name', '')),
+            safe_str(lead.get('city', '')),
+            safe_str(lead.get('category', '')),
+            safe_str(lead.get('website', '')),
+            safe_str(lead.get('email', '')),
+            safe_str(lead.get('secondary_email', '')),
+            safe_str(lead.get('phone', '')),
+            safe_str(lead.get('business_summary', '')),
+            safe_str(lead.get('hooks', '')),
+            safe_str(lead.get('instagram', '')),
+            safe_str(lead.get('facebook', '')),
+            safe_str(lead.get('linkedin', '')),
+            safe_str(lead.get('x', '')),
+            safe_str(lead.get('additional_contact_form', '')),
+            safe_str(lead.get('founder', '')),
+            safe_str(lead.get('lead_status', ''))
+        ]
+        rows_to_add.append(row)
+    
+    if rows_to_add:
+        ws.append_rows(rows_to_add)
+        print(f"[Drive] Appended {len(rows_to_add)} leads to sheet.", flush=True)
+
+
+def fetch_existing_lead_identifiers(sheet_url: str) -> List[Dict]:
+    """
+    Fetch existing lead identifiers from the sheet for deduplication.
+    
+    Returns:
+        List of dicts with: lead_id, business_name, city, website
+    """
+    if not sheet_url:
+        print("[Drive] No sheet URL provided, skipping existing lead fetch.", flush=True)
+        return []
+    
+    try:
+        gc = get_gc()
+        sh = gc.open_by_url(sheet_url)
+        ws = sh.sheet1
+        
+        # Get all records (or could optimize to specific columns)
+        records = ws.get_all_records()
+        
+        # Extract only the fields we need
+        result = []
+        for row in records:
+            result.append({
+                "lead_id": row.get("lead_id", ""),
+                "business_name": row.get("business_name", ""),
+                "city": row.get("city", ""),
+                "website": row.get("website", "")
+            })
+        
+        print(f"[Drive] Fetched {len(result)} existing leads from sheet.", flush=True)
+        return result
+    
+    except Exception as e:
+        print(f"[Drive] Error fetching existing leads: {e}", flush=True)
+        return []
+
