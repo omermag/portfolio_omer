@@ -1,0 +1,145 @@
+import os
+import json
+import openai
+from typing import List, Dict, Set
+from dotenv import load_dotenv
+
+# Initialize generic categories to ignore if the LLM misses them
+# These are globally irrelevant for B2B usually, but per user request, 
+# we rely on the LLM to define the specific scope. 
+# We'll keep the function pure to the LLM's output + strict logic.
+
+def generate_category_rules(target_intents: List[str]) -> Dict[str, Set[str]]:
+    """
+    Generates a whitelist (Allowed) and blacklist (Denied) of business categories
+    based on the user's search intents, using GPT-4o-mini.
+    
+    Args:
+        target_intents: List of search terms (e.g. ['Garage', 'Auto Repair'])
+        
+    Returns:
+        Dict with 'allowed' and 'denied' sets containing normalized Hebrew categories.
+    """
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("[Category Guard] WARNING: No OPENAI_API_KEY found. Defaulting to empty rules (All REVIEW).")
+        return {"allowed": set(), "denied": set()}
+
+    client = openai.OpenAI(api_key=api_key)
+    
+    intents_str = ", ".join(target_intents)
+    
+    prompt = f"""
+    You are an expert lead generation filter for Google Maps in Israel.
+    The user is searching for businesses with the intent: "{intents_str}".
+    
+    Task:
+    1. Generate a "allowed" list of 20-30 Hebrew Google Maps business categories that are RELEVANT matches or "good drift" (e.g. specialized variations).
+    2. Generate a "denied" list of 20-30 Hebrew Google Maps business categories that are clearly IRRELEVANT (out of scope) but might falsely appear in search results due to proximity or keyword overlap (e.g. "Hotel" when looking for "Housing", or "Museum" when looking for "Store").
+    
+    Format:
+    Return strictly valid JSON with two arrays of strings:
+    {{
+        "allowed": ["category1", "category2"],
+        "denied": ["category3", "category4"]
+    }}
+    
+    Language: Hebrew
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that outputs JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3
+        )
+        
+        content = response.choices[0].message.content
+        data = json.loads(content)
+        
+        # Normalize: strip and lower (though Hebrew doesn't have casing, good practice)
+        allowed = {c.strip() for c in data.get("allowed", [])}
+        denied = {c.strip() for c in data.get("denied", [])}
+        
+        print(f"[Category Guard] Generated Rules | Allowed: {len(allowed)} | Denied: {len(denied)}")
+        return {"allowed": allowed, "denied": denied}
+
+    except Exception as e:
+        print(f"[Category Guard] ERROR generating rules: {e}")
+        return {"allowed": set(), "denied": set()}
+
+def _normalize_hebrew(text: str) -> str:
+    """Normalize Hebrew text for comparison."""
+    import re
+    if not text:
+        return ""
+    # Strip whitespace, remove punctuation, keep Hebrew letters and digits
+    text = text.strip()
+    # Remove common punctuation and special chars
+    text = re.sub(r'["\'\-\.\,\(\)\[\]\{\}]', '', text)
+    # Collapse multiple spaces
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def _fuzzy_match(needle: str, haystack: Set[str], threshold: float = 0.75) -> bool:
+    """
+    Check if needle fuzzy-matches any string in haystack.
+    Uses substring matching first, then SequenceMatcher for similarity.
+    """
+    from difflib import SequenceMatcher
+    
+    needle_norm = _normalize_hebrew(needle)
+    if not needle_norm:
+        return False
+    
+    for candidate in haystack:
+        cand_norm = _normalize_hebrew(candidate)
+        if not cand_norm:
+            continue
+            
+        # Exact match after normalization
+        if needle_norm == cand_norm:
+            return True
+            
+        # Substring match (either direction)
+        if needle_norm in cand_norm or cand_norm in needle_norm:
+            return True
+            
+        # Fuzzy similarity
+        ratio = SequenceMatcher(None, needle_norm, cand_norm).ratio()
+        if ratio >= threshold:
+            return True
+    
+    return False
+
+def classify_category(lead_category: str, rules: Dict[str, Set[str]]) -> str:
+    """
+    Classifies a lead category into PASS, REJECT, or REVIEW based on rules.
+    Uses fuzzy matching to handle Hebrew variations from Apify.
+    
+    Args:
+        lead_category: The category string from Google Maps (e.g. "מוסך")
+        rules: Dict with 'allowed' and 'denied' sets
+        
+    Returns:
+        "PASS" | "REJECT" | "REVIEW"
+    """
+    if not lead_category:
+        return "REVIEW"  # No category -> Review
+    
+    # Check Allowed first (fuzzy match)
+    if _fuzzy_match(lead_category, rules["allowed"]):
+        return "PASS"
+    
+    # Check Denied (fuzzy match)
+    if _fuzzy_match(lead_category, rules["denied"]):
+        return "REJECT"
+    
+    # Fallback - unknown category
+    return "REVIEW"
+
