@@ -1,0 +1,1401 @@
+import { Actor, log } from 'apify';
+import { PuppeteerCrawler, RequestQueue } from 'crawlee';
+import * as cheerio from 'cheerio';
+import puppeteerExtra from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import { gotScraping } from 'got-scraping';
+
+// Enhanced stealth configuration
+puppeteerExtra.use(StealthPlugin());
+
+// Social media placeholders for normalized output
+const SOCIAL_PLACEHOLDERS = {
+    instagram: null,
+    beatport: null,
+    bandcamp: null,
+    soundcloud: null,
+    x: null,
+    facebook: null,
+    spotify: null,
+    linktree: null,
+    linkedin: null
+};
+
+// Realistic user agents for rotation
+const REALISTIC_USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+];
+
+// Blocked domains for analytics/tracking
+const BLOCKED_DOMAINS = [
+    'google-analytics.com', 'googletagmanager.com', 'doubleclick.net',
+    'facebook.com/tr', 'connect.facebook.net', 'hotjar.com', 'mixpanel.com', 
+    'segment.com', 'amplitude.com', 'fullstory.com', 'logrocket.com'
+];
+
+// Domain concurrency control
+const domainCounters = new Map();
+const seenUrls = new Set();
+
+function sleep(ms) {
+    return new Promise(res => setTimeout(res, ms));
+}
+
+// HTTP-first fetching for cost reduction
+async function cheapFetch(url, proxyUrl) {
+    try {
+        const res = await gotScraping({
+            url,
+            method: 'GET',
+            timeout: { request: 12000 },
+            headers: {
+                'user-agent': REALISTIC_USER_AGENTS[Math.floor(Math.random() * REALISTIC_USER_AGENTS.length)],
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            },
+            proxyUrl,
+            throwHttpErrors: false,
+        });
+        
+        const html = res.body || '';
+        const ok = res.statusCode < 400 && html.length >= 1000;
+        
+        return { statusCode: res.statusCode, html, ok };
+    } catch (e) {
+        return { statusCode: 0, html: '', ok: false, error: e.message };
+    }
+}
+
+async function acquireDomainSlot(hostname) {
+    const current = domainCounters.get(hostname) || 0;
+    
+    while (current >= 2) {
+        await sleep(300 + Math.random() * 400);
+    }
+    
+    domainCounters.set(hostname, current + 1);
+}
+
+function releaseDomainSlot(hostname) {
+    const current = domainCounters.get(hostname) || 0;
+    domainCounters.set(hostname, Math.max(0, current - 1));
+}
+
+async function smartWaitForContent(page) {
+    try {
+        await page.waitForSelector('body', { timeout: 8000 });
+        
+        const contentCheck = await page.evaluate(() => {
+            const textLength = document.body.textContent.replace(/\s+/g, ' ').trim().length;
+            return textLength > 800;
+        });
+        
+        if (contentCheck) {
+            await page.waitForTimeout(300);
+            return;
+        }
+        
+        const candidates = ['main', '#app', '.content'];
+        for (const sel of candidates) {
+            const found = await page.$(sel);
+            if (found) {
+                await page.waitForTimeout(500);
+                break;
+            }
+        }
+    } catch { /* ignore */ }
+}
+
+function isSuspiciousStatus(code) {
+    return [401, 403, 406, 408, 409, 410, 412, 418, 429, 500, 502, 503, 520, 521, 522, 523, 524].includes(code || 0);
+}
+
+function isHtmlTooShort(html) {
+    if (!html) return true;
+    return html.replace(/\s+/g, ' ').length < 800;
+}
+
+async function robustNavigateWithBackoff(page, url, proxyInfo, attempt = 1) {
+    const maxAttempts = 2;
+    const baseDelay = 1000;
+    
+    try {
+        const resp = await page.goto(url, { 
+            waitUntil: ['domcontentloaded'], 
+            timeout: 30000 
+        });
+        await smartWaitForContent(page);
+        const htmlSnapshot = await page.content();
+        const statusCode = resp?.status() ?? null;
+        
+        if (statusCode && statusCode < 400 && !isHtmlTooShort(htmlSnapshot)) {
+            return { statusCode, isLikelyAlive: true, reason: '', htmlSnapshot };
+        } else {
+            const proxyUrl = proxyInfo?.url || undefined;
+            const fb = await cheapFetch(url, proxyUrl);
+            const ok = (fb.statusCode >= 200 && fb.statusCode < 400) && !isHtmlTooShort(fb.html);
+            
+            return {
+                statusCode: statusCode ?? fb.statusCode ?? 0,
+                isLikelyAlive: ok,
+                reason: ok ? 'HTTP_FALLBACK_OK' : `HTTP_FALLBACK_FAIL:${fb.statusCode || 0}`,
+                htmlSnapshot: ok ? fb.html : htmlSnapshot
+            };
+        }
+    } catch (error) {
+        if (attempt < maxAttempts && !error.message.includes('timeout')) {
+            const delay = baseDelay * Math.pow(2, attempt - 1);
+            log.info(`🔄 Retry ${attempt}/${maxAttempts} for ${url} after ${delay}ms`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return robustNavigateWithBackoff(page, url, proxyInfo, attempt + 1);
+        }
+        
+        return { 
+            statusCode: null, 
+            isLikelyAlive: false, 
+            reason: `GOTO_ERR:${error.message || 'UNKNOWN'}`,
+            htmlSnapshot: ''
+        };
+    }
+}
+
+class PerformanceTracker {
+    constructor() {
+        this.metrics = {
+            totalRequests: 0,
+            blockedRequests: 0,
+            avgResponseTime: 0,
+            bandwidthSaved: 0,
+            httpOnlyLabels: 0,
+            browserOpenedLabels: 0,
+            residentialEscalations: 0
+        };
+        this.startTime = Date.now();
+    }
+    
+    recordRequest(blocked, responseTime, size = 0) {
+        this.metrics.totalRequests++;
+        if (blocked) {
+            this.metrics.blockedRequests++;
+            this.metrics.bandwidthSaved += size;
+        }
+        this.metrics.avgResponseTime = 
+            (this.metrics.avgResponseTime + responseTime) / 2;
+    }
+    
+    recordHttpOnly() {
+        this.metrics.httpOnlyLabels++;
+    }
+    
+    recordBrowserOpened() {
+        this.metrics.browserOpenedLabels++;
+    }
+    
+    recordResidentialEscalation() {
+        this.metrics.residentialEscalations++;
+    }
+    
+    getSummary() {
+        const blockingEfficiency = 
+            (this.metrics.blockedRequests / this.metrics.totalRequests) * 100;
+        const runtime = (Date.now() - this.startTime) / 1000;
+        
+        return {
+            ...this.metrics,
+            blockingEfficiency: `${blockingEfficiency.toFixed(1)}%`,
+            estimatedSavings: `${(this.metrics.bandwidthSaved / 1024 / 1024).toFixed(2)}MB`,
+            avgTimePerLabelSec: `${(runtime / (this.metrics.httpOnlyLabels + this.metrics.browserOpenedLabels)).toFixed(2)}s`,
+            totalRuntime: `${runtime.toFixed(1)}s`,
+            httpOnlyPercent: `${((this.metrics.httpOnlyLabels / (this.metrics.httpOnlyLabels + this.metrics.browserOpenedLabels)) * 100).toFixed(1)}%`
+        };
+    }
+}
+
+class PageStatusTracker {
+    constructor() {
+        this.statusCounts = {};
+    }
+
+    recordPageStatus(url, statusCode, isAlive) {
+        const key = `${statusCode}-${isAlive}`;
+        this.statusCounts[key] = (this.statusCounts[key] || 0) + 1;
+    }
+
+    getSummary() {
+        return this.statusCounts;
+    }
+}
+
+class BulletproofEmailDetector {
+    constructor() {
+        this.commonGenericPrefixes = [
+            'noreply', 'no-reply', 'donotreply', 'admin', 'webmaster', 'postmaster',
+            'mailer-daemon', 'bounce', 'return', 'automated', 'system', 'robot'
+        ];
+        this.spamKeywords = [
+            'newsletter', 'marketing', 'promo', 'deals', 'offers', 'unsubscribe',
+            'support-noreply', 'notification', 'alerts', 'updates'
+        ];
+        this.blockedDomains = [
+            'wixpress.com', 'sentry.wixpress.com', 'sentry-next.wixpress.com', 'example.com'
+        ];
+    }
+
+    extractAndValidate($, baseUrl) {
+        const emails = new Set();
+        const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+        
+        const sources = [
+            $('a[href^="mailto:"]').map((i, el) => $(el).attr('href')?.replace('mailto:', '')).get(),
+            $('body').text().match(emailRegex) || []
+        ];
+
+        sources.flat().forEach(email => {
+            if (email && this.isValidBusinessEmail(email, baseUrl)) {
+                emails.add(email.toLowerCase());
+            }
+        });
+
+        // Limit to max 2 emails per record
+        return Array.from(emails).slice(0, 2);
+    }
+
+    isValidBusinessEmail(email, baseUrl) {
+        if (!email || typeof email !== 'string') return false;
+        
+        const cleanEmail = email.toLowerCase().trim();
+        const [localPart, domain] = cleanEmail.split('@');
+        
+        if (!localPart || !domain) return false;
+        
+        // Block wix/sentry domains and example domains
+        if (this.blockedDomains.some(blocked => domain.includes(blocked))) {
+            return false;
+        }
+        
+        // Enhanced blocking patterns including hex/digit-only locals ≥ 16 chars
+        const suspiciousPatterns = [
+            /^[a-f0-9]{16,}$/i,           // Long hex/digit locals
+            /^[0-9]{16,}$/i,              // Long numeric locals
+            /^[a-f0-9]{24,}$/i,           // Hash-like
+            /^(noreply|no-reply)/i,       // No-reply addresses
+            /^privacy/i,                  // Privacy emails
+            /test|example|sample/i        // Test addresses
+        ];
+        
+        if (suspiciousPatterns.some(p => p.test(localPart))) {
+            return false;
+        }
+        
+        if (this.commonGenericPrefixes.some(prefix => localPart.startsWith(prefix))) {
+            return false;
+        }
+        
+        if (this.spamKeywords.some(keyword => localPart.includes(keyword))) {
+            return false;
+        }
+        
+        return true;
+    }
+}
+
+class EnhancedSocialDetector {
+    constructor() {
+        this.platforms = {
+            instagram: {
+                patterns: ['instagram.com', 'instagr.am'],
+                selectors: ['a[href*="instagram"]', '.instagram', '[class*="instagram"]', '[data-social="instagram"]']
+            },
+            soundcloud: {
+                patterns: ['soundcloud.com'],
+                selectors: ['a[href*="soundcloud"]', '.soundcloud', '[class*="soundcloud"]']
+            },
+            bandcamp: {
+                patterns: ['bandcamp.com'],
+                selectors: ['a[href*="bandcamp"]', '.bandcamp', '[class*="bandcamp"]']
+            },
+            youtube: {
+                patterns: ['youtube.com', 'youtu.be'],
+                selectors: ['a[href*="youtube"]', 'a[href*="youtu.be"]', '.youtube', '[class*="youtube"]']
+            },
+            spotify: {
+                patterns: ['spotify.com', 'open.spotify.com'],
+                selectors: ['a[href*="spotify"]', '.spotify', '[class*="spotify"]']
+            },
+            facebook: {
+                patterns: ['facebook.com', 'fb.com'],
+                selectors: ['a[href*="facebook"]', 'a[href*="fb.com"]', '.facebook', '[class*="facebook"]']
+            },
+            twitter: {
+                patterns: ['twitter.com', 'x.com'],
+                selectors: ['a[href*="twitter"]', 'a[href*="x.com"]', '.twitter', '[class*="twitter"]']
+            },
+            beatport: {
+                patterns: ['beatport.com'],
+                selectors: ['a[href*="beatport"]', '.beatport', '[class*="beatport"]']
+            },
+            linktree: {
+                patterns: ['linktr.ee', 'linktree.com'],
+                selectors: ['a[href*="linktr.ee"]', 'a[href*="linktree"]']
+            },
+            linkedin: {
+                patterns: ['linkedin.com'],
+                selectors: ['a[href*="linkedin"]']
+            }
+        };
+    }
+
+    async detectAllSocialMedia($, page, record) {
+        const socialLinks = {};
+        
+        for (const [platform, config] of Object.entries(this.platforms)) {
+            const links = [];
+            
+            config.selectors.forEach(selector => {
+                $(selector).each((i, el) => {
+                    const $el = $(el);
+                    const href = $el.attr('href');
+                    if (href && config.patterns.some(pattern => href.includes(pattern))) {
+                        links.push(href);
+                    }
+                });
+            });
+            
+            if (links.length > 0) {
+                socialLinks[platform] = [...new Set(links)];
+            }
+        }
+
+        if (page) {
+            try {
+                const dynamicLinks = await page.evaluate(() => {
+                    const links = {};
+                    const anchors = document.querySelectorAll('a[href]');
+                    
+                    anchors.forEach(a => {
+                        const href = a.href;
+                        if (href.includes('instagram.com')) {
+                            links.instagram = links.instagram || [];
+                            links.instagram.push(href);
+                        }
+                        if (href.includes('soundcloud.com')) {
+                            links.soundcloud = links.soundcloud || [];
+                            links.soundcloud.push(href);
+                        }
+                        if (href.includes('bandcamp.com')) {
+                            links.bandcamp = links.bandcamp || [];
+                            links.bandcamp.push(href);
+                        }
+                        if (href.includes('twitter.com') || href.includes('x.com')) {
+                            links.twitter = links.twitter || [];
+                            links.twitter.push(href);
+                        }
+                        if (href.includes('linktr.ee') || href.includes('linktree.com')) {
+                            links.linktree = links.linktree || [];
+                            links.linktree.push(href);
+                        }
+                        if (href.includes('linkedin.com')) {
+                            links.linkedin = links.linkedin || [];
+                            links.linkedin.push(href);
+                        }
+                    });
+                    
+                    return links;
+                });
+
+                Object.keys(dynamicLinks).forEach(platform => {
+                    socialLinks[platform] = [
+                        ...(socialLinks[platform] || []),
+                        ...dynamicLinks[platform]
+                    ];
+                });
+            } catch (e) {
+                log.warning(`Failed to extract dynamic social links: ${e.message}`);
+            }
+        }
+
+        // Normalize to placeholders with single URL or null
+        const normalized = { ...SOCIAL_PLACEHOLDERS };
+        
+        Object.keys(socialLinks).forEach(platform => {
+            if (socialLinks[platform].length > 0) {
+                // Map twitter to x
+                const key = platform === 'twitter' ? 'x' : platform;
+                if (key in normalized) {
+                    normalized[key] = socialLinks[platform][0]; // Take first URL only
+                }
+            }
+        });
+
+        return normalized;
+    }
+}
+
+class SuperEmailDetector extends BulletproofEmailDetector {
+    async scanAllPages($, page, baseUrl, record, queue = null, maxFollowups = 1) {
+        const pagesToScan = ['/about/', '/contact/', '/booking/', '/press/', '/imprint/'];
+        const allEmails = new Set();
+        const foundPages = [];
+        
+        this.extractAndValidate($, baseUrl).forEach(email => allEmails.add(email));
+        
+        for (const pagePath of pagesToScan) {
+            const links = $(`a[href*="${pagePath}"]`);
+            if (links.length > 0) {
+                try {
+                    const pageUrl = new URL(pagePath, baseUrl).toString();
+                    foundPages.push(pageUrl);
+                    log.info(`Found potential contact page: ${pageUrl}`);
+                    
+                    if (queue && record && record._enqueuedPages < maxFollowups) {
+                        await queue.addRequest({
+                            url: pageUrl,
+                            userData: { 
+                                internalId: record._internalId,
+                                id: record.id,
+                                label: record.label,
+                                originalUrl: record.url,
+                                type: 'CONTACT' 
+                            }
+                        });
+                        record._enqueuedPages++;
+                    }
+                } catch (e) {
+                    // Invalid URL, skip
+                }
+            }
+        }
+        
+        return { emails: Array.from(allEmails), foundPages };
+    }
+}
+
+class EnhancedLinkDetector {
+    constructor() {
+        this.socialPlatforms = [
+            'instagram.com', 'facebook.com', 'twitter.com', 'x.com', 'soundcloud.com',
+            'spotify.com', 'bandcamp.com', 'youtube.com', 'tiktok.com', 'beatport.com',
+            'linktr.ee', 'linktree.com', 'linkedin.com'
+        ];
+    }
+
+    detectAllLinks($, baseUrl) {
+        const links = {
+            social: [],
+            contact: [],
+            submission: [],
+            other: []
+        };
+
+        $('a[href]').each((i, element) => {
+            const $link = $(element);
+            const href = $link.attr('href');
+            const text = $link.text().trim().toLowerCase();
+
+            if (!href) return;
+
+            let fullUrl;
+            try {
+                fullUrl = new URL(href, baseUrl).toString();
+            } catch {
+                return;
+            }
+
+            // Skip obvious junk pages
+            const junkPatterns = ['/privacy', '/terms', '/cookies', '/policy'];
+            if (junkPatterns.some(pattern => fullUrl.includes(pattern))) {
+                return;
+            }
+
+            if (this.socialPlatforms.some(platform => fullUrl.includes(platform))) {
+                links.social.push({ url: fullUrl, text, platform: this.getPlatform(fullUrl) });
+            } else if (text.includes('contact') || text.includes('booking') || href.includes('contact')) {
+                links.contact.push({ url: fullUrl, text });
+            } else if (text.includes('demo') || text.includes('submit') || text.includes('upload')) {
+                links.submission.push({ url: fullUrl, text });
+            } else {
+                links.other.push({ url: fullUrl, text });
+            }
+        });
+
+        return links;
+    }
+
+    getPlatform(url) {
+        for (const platform of this.socialPlatforms) {
+            if (url.includes(platform)) {
+                return platform.replace('.com', '');
+            }
+        }
+        return 'unknown';
+    }
+}
+
+class EnhancedSubmissionTypeDetector {
+    constructor() {
+        this.platforms = {
+            'SubmitHub': { 
+                domains: ['submithub.com'], 
+                selectors: ['[src*="submithub"]', '.submithub', 'a[href*="submithub"]'] 
+            },
+            'Groover': { 
+                domains: ['groover.co'], 
+                selectors: ['[src*="groover"]', '.groover', 'a[href*="groover"]'] 
+            },
+            'Trackstack': { 
+                domains: ['trackstack.link', 'trackstack.co', 'trackstack.com', 'tstack.app'], 
+                selectors: ['[src*="trackstack"]', '[src*="tstack"]', 'a[href*="trackstack"]', 'a[href*="tstack"]'] 
+            },
+            'LabelRadar': { 
+                domains: ['labelradar.com', 'label-engine.com'], 
+                selectors: ['[src*="labelradar"]', '[src*="label-engine"]', 'a[href*="labelradar"]', 'a[href*="label-engine"]'] 
+            },
+            'RepostNetwork': { 
+                domains: ['repostnetwork.com'], 
+                selectors: ['[src*="repost"]', 'a[href*="repostnetwork"]'] 
+            },
+            'Toneden': { 
+                domains: ['toneden.io'], 
+                selectors: ['[src*="toneden"]', 'a[href*="toneden"]'] 
+            }
+        };
+    }
+
+    pickBestProviderUrl($, page, domains) {
+        // 1) Prefer direct links first
+        for (const domain of domains) {
+            const links = $(`a[href*="${domain}"]`);
+            if (links.length > 0) {
+                return links.first().attr('href');
+            }
+        }
+        
+        // 2) Then iframes
+        for (const domain of domains) {
+            const iframes = $(`iframe[src*="${domain}"]`);
+            if (iframes.length > 0) {
+                return iframes.first().attr('src');
+            }
+        }
+        
+        // 3) Finally current page if hosted on provider
+        if (page) {
+            try {
+                const currentUrl = page.url();
+                if (domains.some(domain => currentUrl.includes(domain))) {
+                    return currentUrl;
+                }
+            } catch {}
+        }
+        
+        return null;
+    }
+
+    isRelevantSubmissionPage(url, $) {
+        const urlPatterns = [
+            /\/contact/i, /\/demo/i, /\/submit/i, /\/submission/i, /\/upload/i, /\/send/i,
+            /\/portal/i, /\/apply/i, /demos$/i
+        ];
+        const hasRelevantUrl = urlPatterns.some(pattern => pattern.test(url));
+        
+        const pageText = $('h1, h2, h3, title').text().toLowerCase();
+        const relevantKeywords = ['demo', 'submission', 'contact', 'booking', 'send music', 'upload track'];
+        const hasRelevantContent = relevantKeywords.some(keyword => pageText.includes(keyword));
+        
+        const hasEmbeddedPlatform = $('iframe[src*="labelradar"], iframe[src*="submithub"], iframe[src*="trackstack"], iframe[src*="label-engine"]').length > 0;
+        
+        return hasRelevantUrl || hasRelevantContent || hasEmbeddedPlatform;
+    }
+
+    async detectThirdPartySubmissionPlatforms($, page) {
+        const platforms = [];
+        
+        for (const [name, config] of Object.entries(this.platforms)) {
+            let found = false;
+            let platformEntry = { provider: name };
+            
+            // Check iframes
+            const iframes = $(config.selectors.join(', ')).filter('iframe');
+            if (iframes.length > 0) {
+                platformEntry = {
+                    provider: name,
+                    type: 'third-party-embedded',
+                    url: iframes.first().attr('src') || '',
+                    embedded: true
+                };
+                found = true;
+            }
+            
+            // Check links
+            if (!found) {
+                config.domains.forEach(domain => {
+                    const links = $(`a[href*="${domain}"]`);
+                    if (links.length > 0) {
+                        platformEntry = {
+                            provider: name,
+                            type: 'third-party-link',
+                            url: links.first().attr('href'),
+                            embedded: false
+                        };
+                        found = true;
+                    }
+                });
+            }
+            
+            // Check current URL
+            if (!found && page) {
+                try {
+                    const currentUrl = page.url();
+                    config.domains.forEach(domain => {
+                        if (currentUrl.includes(domain)) {
+                            platformEntry = {
+                                provider: name,
+                                type: 'third-party-hosted',
+                                url: currentUrl,
+                                embedded: false,
+                                subdomain: true
+                            };
+                            found = true;
+                        }
+                    });
+                } catch {}
+            }
+            
+            // Ensure URL exists, use helper if needed
+            if (found) {
+                if (!platformEntry.url) {
+                    platformEntry.url = this.pickBestProviderUrl($, page, config.domains);
+                }
+                platforms.push(platformEntry);
+            }
+        }
+        
+        return platforms;
+    }
+
+    countStrongSignals($form) {
+        let signals = 0;
+        
+        const demoFields = $form.find('input[name*="track"], input[name*="demo"], input[name*="song"], textarea[name*="message"]');
+        if (demoFields.length > 0) signals++;
+        
+        const fileUploads = $form.find('input[type="file"][accept*="audio"], input[type="file"][accept*="mp3"], input[name*="track"][type="file"]');
+        if (fileUploads.length > 0) signals++;
+        
+        const artistFields = $form.find('input[name*="artist"], input[name*="band"], input[name*="musician"]');
+        if (artistFields.length > 0) signals++;
+        
+        const submitElems = $form.find('button[type="submit"], input[type="submit"]');
+        const submitText = [
+          submitElems.text(),
+          ...submitElems.map((i, el) => $(el).attr('value') || '').get()
+        ].join(' ').toLowerCase();
+        const demoSubmitWords = ['demo','track','music','upload','send music','submit song','send demo','submit demo'];
+        if (demoSubmitWords.some(w => submitText.includes(w))) signals++;
+        
+        const genreFields = $form.find('select[name*="genre"], select[name*="style"], select[name*="category"], select[name*="type"]');
+        if (genreFields.length > 0) signals++;
+        
+        const platformFields = $form.find('input[name*="soundcloud"], input[name*="spotify"], input[name*="beatport"], input[name*="youtube"], input[placeholder*="soundcloud"], input[placeholder*="spotify"]');
+        if (platformFields.length > 0) signals++;
+        
+        return signals;
+    }
+
+    analyzeForm($form, baseUrl) {
+        const excludedContainers = ['footer', '.footer', '#footer', '.newsletter', '.subscribe', '.mailing-list', '.sidebar', '#sidebar'];
+        if (excludedContainers.some(sel => $form.closest(sel).length > 0)) {
+            return { score: 0, type: 'excluded', reason: 'newsletter/footer container' };
+        }
+        
+        let score = 0;
+        
+        if ($form.find('input[type="email"], input[name*="email"]').length > 0) score += 2;
+        if ($form.find('input[name*="name"], input[type="text"]').length > 0) score += 1;
+        if ($form.find('textarea').length > 0) score += 2;
+        
+        if ($form.find('input[type="file"]').length > 0) score += 4;
+        if ($form.find('input[name*="track"], input[name*="demo"]').length > 0) score += 4;
+        if ($form.find('input[name*="artist"], input[name*="band"]').length > 0) score += 3;
+        
+        if ($form.find('select[name*="genre"], select[name*="style"]').length > 0) score += 3;
+        if ($form.find('input[name*="soundcloud"], input[name*="spotify"]').length > 0) score += 3;
+        
+        const strongSignals = this.countStrongSignals($form);
+        
+        return {
+            score,
+            strongSignals,
+            type: 'native',
+            method: 'contact-form',
+            isValid: score >= 6 && strongSignals >= 2
+        };
+    }
+
+    async detectNativeSubmissionForms($, baseUrl, currentUrl) {
+        const forms = [];
+        
+        const isRelevantPage = this.isRelevantSubmissionPage(currentUrl, $);
+        if (!isRelevantPage) {
+            return forms;
+        }
+        
+        const $forms = $('form').not('footer form, .newsletter form, .sidebar form, [class*="newsletter"] form, [class*="subscribe"] form');
+        
+        $forms.each((i, form) => {
+            const analysis = this.analyzeForm($(form), baseUrl);
+            if (analysis.isValid) {
+                forms.push(analysis);
+            }
+        });
+        
+        return forms;
+    }
+
+    async detectSubmissionType($, url, page) {
+        const thirdPartyPlatforms = await this.detectThirdPartySubmissionPlatforms($, page);
+        if (thirdPartyPlatforms.length > 0) {
+            // Prefer entries with URLs
+            const withUrl = thirdPartyPlatforms.find(p => p.url);
+            return {
+                type: 'third-party',
+                platforms: thirdPartyPlatforms,
+                details: withUrl || thirdPartyPlatforms[0]
+            };
+        }
+        
+        const nativeForms = await this.detectNativeSubmissionForms($, url, url);
+        const validNativeForms = nativeForms.filter(form => form.isValid);
+        
+        if (validNativeForms.length > 0) {
+            return {
+                type: 'native',
+                method: validNativeForms[0].method,
+                score: validNativeForms[0].score,
+                signals: validNativeForms[0].strongSignals,
+                forms: validNativeForms
+            };
+        }
+        
+        return { 
+            type: 'none', 
+            reason: 'No valid submission forms found with sufficient signals' 
+        };
+    }
+}
+
+// Static parsing helpers for HTTP-first approach
+async function parseStatic(html, baseUrl, record, proxyUrl) {
+    const $ = cheerio.load(html);
+    
+    // Detect links before pruning
+    const detectedLinks = linkDetector.detectAllLinks($, baseUrl);
+    
+    // Extract emails
+    record.emails = emailDetector.extractAndValidate($, baseUrl);
+    
+    // Detect social media
+    record.socialLinks = await socialDetector.detectAllSocialMedia($, null, record);
+    
+    // Detect submission type
+    const submissionAnalysis = await submissionTypeDetector.detectSubmissionType($, baseUrl, null);
+    record.submissionType = submissionAnalysis.type;
+    record.submissionMethod = submissionAnalysis.method || '';
+    record.submissionDetails = submissionAnalysis.details || { reason: submissionAnalysis.reason };
+    
+    if (submissionAnalysis.type === 'third-party' && submissionAnalysis.details?.url) {
+        record.submissionPage = submissionAnalysis.details.url;
+    }
+    
+    // Set pages from detected links
+    if (detectedLinks.contact.length > 0) {
+        record.contactPage = detectedLinks.contact[0].url;
+    }
+    
+    const aboutLink = detectedLinks.other.find(link => 
+        link.text.includes('about') || link.url.includes('/about')
+    );
+    if (aboutLink) {
+        record.aboutPage = aboutLink.url;
+    }
+    
+    const candidateSubmission = detectedLinks.submission[0]?.url;
+    if (candidateSubmission && !record.submissionPage) {
+        const urlPatterns = [/\/contact/i, /\/demo/i, /\/submit/i, /\/submission/i, /\/upload/i, /\/send/i, /\/portal/i, /\/apply/i, /demos$/i];
+        const pageIsRelevant = urlPatterns.some(pattern => pattern.test(candidateSubmission));
+        if (pageIsRelevant) {
+            record.submissionPage = candidateSubmission;
+        }
+    }
+    
+    // Extract main text
+    $('script, style, .cookie, .gdpr').remove();
+    const contentSelectors = [
+        'main', 'article', '.content', '.main-content', 
+        '#content', '.page-content', 'body'
+    ];
+
+    let textContent = '';
+    for (const selector of contentSelectors) {
+        const content = $(selector).first();
+        if (content.length > 0) {
+            textContent = content.text();
+            break;
+        }
+    }
+
+    const cleanText = textContent.replace(/\s+/g, ' ').trim();
+    const words = cleanText.split(/\s+/).filter(word => word.length > 2);
+    record.mainText = words.slice(0, 150).join(' ');
+    
+    // Follow up on discovered pages (max 2)
+    const followUpPages = [];
+    if (record.contactPage && !seenUrls.has(record.contactPage)) {
+        followUpPages.push(record.contactPage);
+        seenUrls.add(record.contactPage);
+    }
+    if (record.submissionPage && !seenUrls.has(record.submissionPage) && followUpPages.length < 2) {
+        followUpPages.push(record.submissionPage);
+        seenUrls.add(record.submissionPage);
+    }
+    
+    for (const pageUrl of followUpPages) {
+        try {
+            const followUpResult = await cheapFetch(pageUrl, proxyUrl);
+            if (followUpResult.ok) {
+                await parseStaticFollowUp(followUpResult.html, pageUrl, record);
+            }
+        } catch (e) {
+            log.warning(`Failed to fetch follow-up page ${pageUrl}: ${e.message}`);
+        }
+    }
+    
+    return record;
+}
+
+async function parseStaticFollowUp(html, url, record) {
+    const $ = cheerio.load(html);
+    
+    // Add new emails
+    const newEmails = emailDetector.extractAndValidate($, url);
+    const allEmails = [...new Set([...record.emails, ...newEmails])];
+    record.emails = allEmails.slice(0, 2); // Max 2 emails
+    
+    // Check for third-party platform URLs if not already set
+    if (!record.submissionPage || record.submissionType !== 'third-party') {
+        const submissionAnalysis = await submissionTypeDetector.detectSubmissionType($, url, null);
+        if (submissionAnalysis.type === 'third-party' && submissionAnalysis.details?.url) {
+            record.submissionType = 'third-party';
+            record.submissionMethod = submissionAnalysis.details.provider;
+            record.submissionDetails = submissionAnalysis.details;
+            record.submissionPage = submissionAnalysis.details.url;
+        }
+    }
+}
+
+function shouldSkipPuppeteer(record) {
+    // Skip if we have sufficient data from static parsing
+    const socialCount = Object.values(record.socialLinks).filter(link => link !== null).length;
+    const hasThirdParty = record.submissionType === 'third-party' && record.submissionPage;
+    const hasEmails = record.emails.length > 0;
+    
+    return socialCount >= 2 || hasThirdParty || hasEmails;
+}
+
+// Initialize components
+const pageStatusTracker = new PageStatusTracker();
+const performanceTracker = new PerformanceTracker();
+const emailDetector = new SuperEmailDetector();
+const socialDetector = new EnhancedSocialDetector();
+const linkDetector = new EnhancedLinkDetector();
+const submissionTypeDetector = new EnhancedSubmissionTypeDetector();
+
+// Main Actor logic
+Actor.main(async () => {
+    const input = await Actor.getInput();
+    
+    if (!input || (!input.urls && !Array.isArray(input))) {
+        throw new Error('Invalid input: Expected array of objects with id, label, and url fields, or legacy "urls" array');
+    }
+
+    let labelData;
+    if (Array.isArray(input)) {
+        labelData = input;
+    } else if (input.urls) {
+        labelData = input.urls.map((url, index) => ({
+            id: (index + 1).toString(),
+            label: `label_${index + 1}`,
+            url: url.trim()
+        }));
+    } else {
+        throw new Error('Invalid input format');
+    }
+
+    // Input configuration with defaults
+    const httpFirstEnabled = input.httpFirstEnabled !== false; // Default true
+    const proxyMode = (input.proxyMode || 'auto').toLowerCase(); // 'auto' | 'residential' | 'none'
+    const maxFollowups = input.maxFollowups || { http: 2, browser: 1 };
+
+    labelData.forEach((item, index) => {
+        if (!item.id || !item.label || !item.url) {
+            throw new Error(`Invalid item at index ${index}: Missing required fields (id, label, url)`);
+        }
+    });
+
+    log.info(`🎵 Starting HTTP-first music label crawler for ${labelData.length} labels`);
+    log.info(`📊 Config: httpFirst=${httpFirstEnabled}, proxyMode=${proxyMode}, maxFollowups=${JSON.stringify(maxFollowups)}`);
+
+    const results = labelData.map((item, index) => ({
+        // Tracking information
+        id: item.id,
+        label: item.label,
+        url: item.url.trim(),
+        
+        // Crawling results
+        ifPageAlive: false,
+        mainText: '',
+        emails: [],
+        socialLinks: { ...SOCIAL_PLACEHOLDERS },
+        contactPage: '',
+        aboutPage: '',
+        submissionPage: '',
+        submissionType: 'none',
+        submissionMethod: '',
+        submissionDetails: null,
+        
+        // Internal tracking
+        _internalId: index + 1,
+        _enqueuedPages: 0,
+        _needsPuppeteer: false
+    }));
+
+    // Build proxy config based on mode
+    let proxyConfig = null;
+    if (proxyMode === 'residential') {
+        proxyConfig = await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'] }).catch(() => null);
+    } else if (proxyMode === 'auto') {
+        // Default Apify datacenter pool (cheapest)
+        proxyConfig = await Actor.createProxyConfiguration({}).catch(() => null);
+    } else {
+        // 'none' = no Apify proxy
+        proxyConfig = null;
+    }
+
+    // HTTP-first processing
+    if (httpFirstEnabled) {
+        log.info('🌐 Starting HTTP-first processing phase...');
+        
+        for (const result of results) {
+            if (seenUrls.has(result.url)) {
+                log.info(`⏭️ Skipping already seen URL: ${result.url}`);
+                continue;
+            }
+            
+            seenUrls.add(result.url);
+            
+            try {
+                const proxyUrl = proxyConfig?.newUrl?.() || undefined;
+                const httpResult = await cheapFetch(result.url, proxyUrl);
+                
+                if (httpResult.ok) {
+                    log.info(`📄 HTTP success for ${result.label}: ${httpResult.statusCode}`);
+                    result.ifPageAlive = true;
+                    
+                    // Parse static HTML
+                    await parseStatic(httpResult.html, result.url, result, proxyUrl);
+                    
+                    // Check if we need Puppeteer
+                    if (shouldSkipPuppeteer(result)) {
+                        log.info(`✅ HTTP-only complete for ${result.label} (socials: ${Object.values(result.socialLinks).filter(l => l).length}, emails: ${result.emails.length}, submission: ${result.submissionType})`);
+                        performanceTracker.recordHttpOnly();
+                    } else {
+                        log.info(`🔄 Scheduling Puppeteer for ${result.label} (insufficient data from HTTP)`);
+                        result._needsPuppeteer = true;
+                    }
+                } else {
+                    log.warning(`❌ HTTP failed for ${result.label}: ${httpResult.statusCode} - scheduling Puppeteer`);
+                    result._needsPuppeteer = true;
+                }
+            } catch (e) {
+                log.error(`💥 HTTP error for ${result.label}: ${e.message} - scheduling Puppeteer`);
+                result._needsPuppeteer = true;
+            }
+        }
+        
+        const httpOnlyCount = results.filter(r => !r._needsPuppeteer).length;
+        log.info(`📊 HTTP phase complete: ${httpOnlyCount}/${results.length} (${((httpOnlyCount/results.length)*100).toFixed(1)}%) completed without browser`);
+    } else {
+        // If HTTP-first disabled, mark all for Puppeteer
+        results.forEach(result => result._needsPuppeteer = true);
+    }
+
+    // Puppeteer processing for remaining labels
+    const puppeteerLabels = results.filter(r => r._needsPuppeteer);
+    
+    if (puppeteerLabels.length > 0) {
+        log.info(`🌐 Starting Puppeteer processing for ${puppeteerLabels.length} labels...`);
+        
+        const queue = await RequestQueue.open();
+
+        // Enqueue only labels that need Puppeteer processing
+        for (const result of puppeteerLabels) {
+            await queue.addRequest({
+                url: result.url,
+                userData: { 
+                    internalId: result._internalId,
+                    id: result.id,
+                    label: result.label,
+                    originalUrl: result.url,
+                    type: 'MAIN' 
+                }
+            });
+        }
+        
+        const sessionPoolOptions = {
+            maxPoolSize: 20,
+            sessionOptions: {
+                maxAgeSecs: 3600,
+                maxUsageCount: 50,
+            },
+        };
+
+        const crawler = new PuppeteerCrawler({
+            requestQueue: queue,
+            maxConcurrency: 6,
+            requestHandlerTimeoutSecs: 90,
+            maxRequestRetries: 1, // Reduced retries
+            proxyConfiguration: proxyConfig || undefined,
+            sessionPoolOptions,
+            useSessionPool: true,
+            persistCookiesPerSession: true,
+
+            launchContext: {
+                launcher: puppeteerExtra,
+                launchOptions: {
+                    headless: true,
+                    args: [
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--no-first-run',
+                        '--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-web-security',
+                        '--window-size=1366,768',
+                    ],
+                },
+            },
+
+            preNavigationHooks: [
+                async ({ page, request, session, proxyInfo }, gotoOptions) => {
+                    // Acquire domain slot for throttling
+                    const hostname = new URL(request.url).hostname;
+                    await acquireDomainSlot(hostname);
+                    
+                    // Prevent duplicate request listeners
+                    page.removeAllListeners('request');
+                    await page.setRequestInterception(true);
+                    page.on('request', (req) => {
+                        const requestStartTime = Date.now();
+                        const url = req.url();
+                        const type = req.resourceType();
+                        
+                        // Block by type OR domain
+                        if (['image', 'media', 'font', 'stylesheet', 'websocket', 'other'].includes(type) ||
+                            BLOCKED_DOMAINS.some(domain => url.includes(domain))) {
+                            req.abort();
+                            performanceTracker.recordRequest(true, Date.now() - requestStartTime, 1024);
+                        } else {
+                            req.continue();
+                            performanceTracker.recordRequest(false, Date.now() - requestStartTime, 0);
+                        }
+                    });
+
+                    // Dynamic user-agent rotation
+                    const ua = REALISTIC_USER_AGENTS[Math.floor(Math.random() * REALISTIC_USER_AGENTS.length)];
+                    await page.setUserAgent(ua);
+
+                    // Realistic viewport based on user-agent
+                    const viewports = {
+                        'Windows': { width: 1920, height: 1080 },
+                        'Mac': { width: 1440, height: 900 },
+                        'Linux': { width: 1366, height: 768 }
+                    };
+                    const os = ua.includes('Windows') ? 'Windows' : ua.includes('Mac') ? 'Mac' : 'Linux';
+                    await page.setViewport(viewports[os]);
+
+                    await sleep(300 + Math.floor(Math.random() * 500));
+
+                    // Quick cookie consent
+                    try {
+                        await page.waitForSelector('[id*="accept"], [class*="accept"], [class*="consent"]', { timeout: 1500 });
+                        const btn = await page.$('[id*="accept"], [class*="accept"], [class*="consent"]');
+                        if (btn) await btn.click().catch(() => {});
+                        await sleep(300);
+                    } catch { /* ignore */ }
+
+                    gotoOptions.waitUntil = ['domcontentloaded'];
+                    gotoOptions.timeout = 30000;
+                }
+            ],
+
+            async requestHandler({ request, page, session, proxyInfo }) {
+                const hostname = new URL(request.url).hostname;
+                
+                try {
+                    const startTime = Date.now();
+                    const record = results.find(r => r._internalId === request.userData.internalId);
+                    if (!record) {
+                        log.warning(`⚠️ Record not found for internal ID: ${request.userData.internalId}`);
+                        return;
+                    }
+
+                    // Skip navigation for SKIP requests
+                    if (request.userData.type === 'SKIP') {
+                        return;
+                    }
+
+                    const attempt = request.userData.attempt || 1;
+                    const mode = request.userData.mode || 'DEFAULT';
+                    log.info(`🌐 Processing [${request.userData.type}] ${request.userData.label} (${request.url}) - attempt: ${attempt}, mode: ${mode}`);
+
+                    performanceTracker.recordBrowserOpened();
+
+                    const pageStatusInfo = await robustNavigateWithBackoff(page, request.url, proxyInfo);
+                    const { statusCode, isLikelyAlive, reason, htmlSnapshot } = pageStatusInfo;
+
+                    pageStatusTracker.recordPageStatus(request.url, statusCode ?? 0, isLikelyAlive);
+
+                    // Mark bad sessions on blocks and escalate to residential if in auto mode
+                    if (!isLikelyAlive && isSuspiciousStatus(statusCode)) {
+                        session?.markBad?.();
+                        
+                        if (proxyMode === 'auto' && !request.userData.escalatedToResidential) {
+                            log.info(`🔄 Escalating to residential proxy for ${request.userData.label}`);
+                            performanceTracker.recordResidentialEscalation();
+                            
+                            // Re-enqueue with residential proxy
+                            const residentialProxyConfig = await Actor.createProxyConfiguration({ groups: ['RESIDENTIAL'] }).catch(() => null);
+                            
+                            await queue.addRequest({
+                                url: request.url,
+                                userData: { 
+                                    ...request.userData, 
+                                    escalatedToResidential: true,
+                                    attempt: 1 
+                                },
+                                uniqueKey: `${request.url}::residential`
+                            });
+                            return;
+                        }
+                    }
+
+                    if (request.userData.type === 'MAIN') {
+                        record.ifPageAlive = isLikelyAlive;
+                    }
+
+                    if (!isLikelyAlive) {
+                        log.warning(`⚠️ Skipping content processing for page flagged dead: ${request.url} — reason: ${reason}`);
+                        if (request.userData.type === 'MAIN') {
+                            record.mainText = `PAGE_NOT_ACCESSIBLE:${reason || 'UNKNOWN'}`;
+                        }
+                        
+                        if (attempt < 2 && !request.userData.escalatedToResidential) {
+                            await queue.addRequest({
+                                url: request.url,
+                                userData: { ...request.userData, attempt: attempt + 1 },
+                                uniqueKey: `${request.url}::${request.userData.type}::${attempt + 1}`
+                            });
+                            
+                            if (request.userData.type === 'MAIN') {
+                                record.mainText = `RETRY_SCHEDULED_${reason}`;
+                            }
+                            return;
+                        }
+                        
+                        return;
+                    }
+
+                    const html = htmlSnapshot || await page.content();
+                    const $ = cheerio.load(html);
+
+                    if (request.userData.type === 'MAIN') {
+                        // Detect links BEFORE pruning DOM
+                        const detectedLinks = linkDetector.detectAllLinks($, record.url);
+                        
+                        // Prune DOM for clean text extraction
+                        $('script, style, .cookie, .gdpr').remove();
+                        const contentSelectors = [
+                            'main', 'article', '.content', '.main-content', 
+                            '#content', '.page-content', 'body'
+                        ];
+
+                        let textContent = '';
+                        for (const selector of contentSelectors) {
+                            const content = $(selector).first();
+                            if (content.length > 0) {
+                                textContent = content.text();
+                                break;
+                            }
+                        }
+
+                        const cleanText = textContent.replace(/\s+/g, ' ').trim();
+                        const words = cleanText.split(/\s+/).filter(word => word.length > 2);
+                        record.mainText = words.slice(0, 150).join(' ');
+
+                        const emailResult = await emailDetector.scanAllPages($, page, record.url, record, queue, maxFollowups.browser);
+                        record.emails = [...new Set([...record.emails, ...emailResult.emails])].slice(0, 2);
+
+                        record.socialLinks = await socialDetector.detectAllSocialMedia($, page, record);
+
+                        // Set contact/about pages from detected links
+                        if (detectedLinks.contact.length > 0 && !record.contactPage) {
+                            record.contactPage = detectedLinks.contact[0].url;
+                        }
+                        
+                        const aboutLink = detectedLinks.other.find(link => 
+                            link.text.includes('about') || link.url.includes('/about')
+                        );
+                        if (aboutLink && !record.aboutPage) {
+                            record.aboutPage = aboutLink.url;
+                        }
+                        
+                        // Gate submission page with URL pattern only
+                        const candidateSubmission = detectedLinks.submission[0]?.url;
+                        if (candidateSubmission && !record.submissionPage) {
+                            const urlPatterns = [/\/contact/i, /\/demo/i, /\/submit/i, /\/submission/i, /\/upload/i, /\/send/i, /\/portal/i, /\/apply/i, /demos$/i];
+                            const pageIsRelevant = urlPatterns.some(pattern => pattern.test(candidateSubmission));
+                            if (pageIsRelevant) {
+                                record.submissionPage = candidateSubmission;
+                            }
+                        }
+
+                        const submissionAnalysis = await submissionTypeDetector.detectSubmissionType($, request.url, page);
+                        
+                        if (submissionAnalysis.type === 'third-party') {
+                            record.submissionType = 'third-party';
+                            record.submissionMethod = submissionAnalysis.details.provider;
+                            record.submissionDetails = {
+                                provider: submissionAnalysis.details.provider,
+                                embedded: submissionAnalysis.details.embedded,
+                                url: submissionAnalysis.details.url,
+                                subdomain: submissionAnalysis.details.subdomain || false
+                            };
+                            
+                            // Set submissionPage from details.url if available
+                            if (submissionAnalysis.details.url && !record.submissionPage) {
+                                record.submissionPage = submissionAnalysis.details.url;
+                            }
+                            
+                            log.info(`🎯 Detected third-party platform: ${submissionAnalysis.details.provider} for ${record.label}`);
+                        } else if (submissionAnalysis.type === 'native') {
+                            record.submissionType = 'native';
+                            record.submissionMethod = submissionAnalysis.method;
+                            record.submissionDetails = {
+                                score: submissionAnalysis.score,
+                                signals: submissionAnalysis.signals,
+                                formsFound: submissionAnalysis.forms.length
+                            };
+                            log.info(`🎯 Detected native form for ${record.label} with score ${submissionAnalysis.score}, signals ${submissionAnalysis.signals}`);
+                        } else if (!record.submissionType || record.submissionType === 'none') {
+                            record.submissionType = 'none';
+                            record.submissionMethod = '';
+                            record.submissionDetails = { reason: submissionAnalysis.reason };
+                        }
+
+                        // Reduced follow-ups: skip if third-party already found or limit to 1
+                        const skipFollowUps = record.submissionType === 'third-party' || record._enqueuedPages >= 1;
+
+                        if (!skipFollowUps && record.contactPage && record.contactPage !== record.url) {
+                            await queue.addRequest({
+                                url: record.contactPage,
+                                userData: { 
+                                    internalId: record._internalId,
+                                    id: record.id,
+                                    label: record.label,
+                                    originalUrl: record.url,
+                                    type: 'CONTACT' 
+                                }
+                            });
+                            record._enqueuedPages++;
+                        }
+                    }
+
+                    if (request.userData.type === 'CONTACT' || request.userData.type === 'ABOUT') {
+                        const pageEmails = emailDetector.extractAndValidate($, record.url);
+                        const allEmails = [...new Set([...record.emails, ...pageEmails])];
+                        record.emails = allEmails.slice(0, 2);
+                        
+                        log.info(`📧 Found ${pageEmails.length} additional emails on ${request.userData.type} page for ${request.userData.label}`);
+                    }
+
+                    const processingTime = Date.now() - startTime;
+                    log.info(`✅ Completed [${request.userData.type}] ${request.userData.label} in ${processingTime}ms (alive: ${isLikelyAlive})`);
+                } finally {
+                    releaseDomainSlot(hostname);
+                }
+            },
+
+            failedRequestHandler: async ({ request, error }) => {
+                const hostname = new URL(request.url).hostname;
+                releaseDomainSlot(hostname);
+                
+                log.error(`❌ Final failure for ${request.userData.label} (${request.url}) - attempt=${request.userData.attempt || 1}: ${error.message}`);
+                pageStatusTracker.recordPageStatus(request.url, 500, false);
+                
+                const record = results.find(r => r._internalId === request.userData.internalId);
+                if (record && request.userData.type === 'MAIN') {
+                    record.ifPageAlive = false;
+                    record.mainText = `FAILED_TO_LOAD_${request.userData.mode || 'DEFAULT'}`;
+                }
+            }
+        });
+
+        log.info('🚀 Starting Puppeteer crawler...');
+        await crawler.run();
+    }
+
+    // Clean up internal tracking from results
+    const cleanResults = results.map(record => {
+        const { _internalId, _enqueuedPages, _needsPuppeteer, ...cleanRecord } = record;
+        return cleanRecord;
+    });
+
+    const summary = {
+        totalProcessed: cleanResults.length,
+        alivePages: cleanResults.filter(r => r.ifPageAlive).length,
+        withEmails: cleanResults.filter(r => r.emails.length > 0).length,
+        withSocialLinks: cleanResults.filter(r => Object.values(r.socialLinks).some(link => link !== null)).length,
+        withSubmissionForms: cleanResults.filter(r => r.submissionType !== 'none').length,
+        submissionTypes: {
+            native: cleanResults.filter(r => r.submissionType === 'native').length,
+            thirdParty: cleanResults.filter(r => r.submissionType === 'third-party').length,
+            none: cleanResults.filter(r => r.submissionType === 'none').length
+        },
+        pageStatusSummary: pageStatusTracker.getSummary(),
+        performanceSummary: performanceTracker.getSummary(),
+        // New metrics
+        httpOnlyLabels: performanceTracker.metrics.httpOnlyLabels,
+        browserOpenedLabels: performanceTracker.metrics.browserOpenedLabels,
+        residentialEscalations: performanceTracker.metrics.residentialEscalations,
+        avgTimePerLabelSec: performanceTracker.getSummary().avgTimePerLabelSec,
+        httpOnlyPercent: performanceTracker.getSummary().httpOnlyPercent
+    };
+
+    log.info('📊 Final Summary:', summary);
+    log.info('🎯 Performance Metrics:', performanceTracker.getSummary());
+
+    // Validation checks
+    const httpOnlyPercent = (summary.httpOnlyLabels / summary.totalProcessed) * 100;
+    const residentialPercent = (summary.residentialEscalations / summary.totalProcessed) * 100;
+    
+    log.info(`✅ Target validation: HTTP-only: ${httpOnlyPercent.toFixed(1)}% (target: ≥65%), Residential escalations: ${residentialPercent.toFixed(1)}% (target: ≤10%)`);
+
+    await Actor.pushData(cleanResults);
+    await Actor.setValue('SUMMARY', summary);
+
+    log.info(`🎯 HTTP-first crawler completed! Processed ${cleanResults.length} labels with ${summary.httpOnlyPercent} HTTP-only completion rate.`);
+});
