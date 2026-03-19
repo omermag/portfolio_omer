@@ -1,0 +1,91 @@
+# -*- coding: utf-8 -*-
+"""
+DuckDuckGo Search Service for Email Fallback
+Uses Hebrew-only queries for Israeli businesses.
+"""
+from duckduckgo_search import DDGS
+from typing import Optional
+import re
+
+# Import validation from utils
+from utils import is_valid_email, SYSTEM_DOMAINS
+
+def search_for_email(business_name: str, city: str) -> Optional[str]:
+    """
+    Use DuckDuckGo to find business email addresses.
+    
+    Hebrew-only queries:
+    1. "{business_name}" אימייל
+    2. "{business_name}" {city} יצירת קשר
+    
+    No English queries. No broad searches.
+    """
+    queries = [
+        f'"{business_name}" אימייל',
+        f'"{business_name}" {city} יצירת קשר',
+    ]
+    
+    try:
+        with DDGS() as ddgs:
+            for query in queries:
+                print(f"[DDG Search] Trying: {query}", flush=True)
+                
+                # Get top results
+                results = list(ddgs.text(query, max_results=5))
+                
+                if not results:
+                    continue
+                
+                # Combine all text from results
+                all_text = ""
+                for result in results:
+                    all_text += result.get('body', '') + " "
+                    all_text += result.get('title', '') + " "
+                    # Also check the URL for email patterns
+                    url = result.get('href', '')
+                    if url:
+                        all_text += url + " "
+                
+                # Extract emails
+                email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
+                raw_emails = re.findall(email_pattern, all_text, re.IGNORECASE)
+                
+                # Filter using the same validation as main extraction
+                valid_emails = [
+                    email.lower() for email in raw_emails 
+                    if is_valid_email(email)
+                ]
+                
+                if valid_emails:
+                    # Return first valid email
+                    email = valid_emails[0]
+                    print(f"[DDG Search] Found: {email}", flush=True)
+                    return email
+        
+        print(f"[DDG Search] No email found after {len(queries)} queries", flush=True)
+        return None
+            
+    except Exception as e:
+        print(f"[DDG Search] Error: {e}", flush=True)
+        return None
+
+def search_for_contact_info(business_name: str, city: str) -> dict:
+    """
+    Search for business contact information.
+    
+    Returns: {
+        "email": str or None,
+        "phone": str or None
+    }
+    """
+    result = {
+        "email": None,
+        "phone": None
+    }
+    
+    try:
+        result["email"] = search_for_email(business_name, city)
+    except Exception as e:
+        print(f"[DDG Search] Error in contact search: {e}", flush=True)
+    
+    return result
