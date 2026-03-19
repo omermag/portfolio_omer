@@ -1,0 +1,85 @@
+import httpx
+import html2text
+import asyncio
+from typing import List, Optional
+import re
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+
+# Configure html2text
+h = html2text.HTML2Text()
+h.ignore_links = False
+h.ignore_images = True
+h.ignore_emphasis = True
+h.body_width = 0
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
+
+TIMEOUT = httpx.Timeout(15.0, connect=10.0)
+
+async def fetch_page_content(client: httpx.AsyncClient, url: str) -> Optional[str]:
+    """Fetches a single page and converts to Markdown."""
+    try:
+        response = await client.get(url, headers=HEADERS)
+        response.raise_for_status()
+        # Basic encoding fix
+        response.encoding = 'utf-8' 
+        return h.handle(response.text)
+    except Exception as e:
+        # print(f"DEBUG: Error fetching {url}: {e}")
+        return None
+
+def extract_subpaths(html_content: str, base_url: str) -> List[str]:
+    """Quickly parses HTML to find relevant contact/about links."""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    links = set()
+    keywords = ['contact', 'about', 'team', 'צור קשר', 'אודות', 'צוות']
+    
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        # Check if keyword in href (simple heuristic) or text
+        if any(k in href.lower() for k in keywords):
+            full_url = urljoin(base_url, href)
+            # Ensure it's the same domain
+            if urlparse(full_url).netloc == urlparse(base_url).netloc:
+                links.add(full_url)
+    
+    return list(links)[:3] # Limit to 3 subpages
+
+async def scrape_website(url: str) -> str:
+    """Scrapes homepage + up to 3 subpages and concatenates markdown."""
+    async with httpx.AsyncClient(timeout=TIMEOUT, verify=False) as client:
+        # 1. Fetch Homepage
+        try:
+            home_resp = await client.get(url, headers=HEADERS)
+            home_resp.raise_for_status()
+            home_text = h.handle(home_resp.text)
+            
+            # 2. Find Subpages
+            subpages = extract_subpaths(home_resp.text, url)
+            
+            # 3. Fetch Subpages in parallel
+            tasks = [fetch_page_content(client, link) for link in subpages]
+            sub_contents = await asyncio.gather(*tasks)
+            
+            # 4. Combine
+            full_content = f"# HOMEPAGE ({url})\n{home_text}\n"
+            for link, content in zip(subpages, sub_contents):
+                if content:
+                    full_content += f"\n# SUBPAGE ({link})\n{content}\n"
+            
+            return full_content
+            
+        except Exception as e:
+            # print(f"DEBUG: Failed to scrape {url}: {e}")
+            return ""
+
+if __name__ == "__main__":
+    # Test
+    url = "https://www.example.com" 
+    # Need to run in event loop
+    loop = asyncio.new_event_loop()
+    content = loop.run_until_complete(scrape_website(url))
+    print(f"Scraped {len(content)} chars.")
