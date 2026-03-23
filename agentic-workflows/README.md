@@ -1,49 +1,64 @@
-# Agentic Workflows
+Agentic Workflows
 
 This folder contains agentic workflow systems built for real-world research, orchestration, and automation execution.
 
-The work here combines Claude Code, DOE-style system design, n8n orchestration, and self-healing workflow logic to build practical automation flows that can reason, route, recover, and improve through iteration.
+The work here combines Claude Code, DOE-style system design, n8n orchestration, and self-healing workflow logic to build practical systems that can route tasks, validate outputs, recover from failure, and improve through iteration.
 
-## Core Themes
+Scope
 
-- agent-assisted execution
-- research-driven workflows
-- orchestration across tools and logic layers
-- iterative system improvement
-- fallback and recovery patterns
-- self-healing automation design
-- structured routing and enrichment flows
+This folder focuses on workflows such as:
 
-## Methods and Tools
+research-to-action systems
+lead enrichment and routing flows
+multi-step automation logic
+agent-assisted execution
+fallback and recovery handling
+structured validation and retry patterns
+Tools and Methods
+Claude Code
 
-### Claude Code
-Used as a hands-on execution layer for building, refining, testing, and improving workflow-connected systems.
+Used for planning, execution, debugging, refinement, and iterative improvement of workflow-connected systems.
 
-### DOE
-Used as a practical framework for structured iteration, controlled improvement, comparison, and refinement of workflows and automation systems.
+DOE-Style Design
 
-### n8n
-Used for orchestration, integrations, branching logic, data movement, routing, and operational workflow execution.
+Used as a structured approach for testing, comparing, and improving workflow logic over time.
 
-### Self-Healing Workflow Design
-Used to make systems more resilient through validation, retries, alternate execution paths, recovery logic, and controlled fallbacks.
+n8n
 
-### Research-Led Execution
-Many of these workflows begin with a research or discovery stage, then move into validation, decision logic, enrichment, and execution.
+Used for orchestration, integrations, branching logic, routing, and operational workflow execution.
 
-## Typical Contents
+Self-Healing Logic
+
+Used to improve reliability through validation, retries, fallback paths, and recovery patterns.
+
+Integrations
+
+Depending on the project, workflows in this folder may connect with tools and systems such as:
+
+Gmail
+Slack
+Perplexity
+CRM platforms
+OCR pipelines
+Claude-based agents
+chatbot interfaces
+external APIs
+scraping and enrichment systems
+structured databases
+Google Cloud services
+AI-assisted tooling
+Typical Contents
 
 This folder may include:
-- agentic workflow structures
-- orchestration logic
-- Claude Code-based execution flows
-- research-to-action systems
-- self-healing automation patterns
-- experimental process designs
-- internal documentation and workflow notes
 
-## Notes
+workflow architectures
+orchestration logic
+execution patterns
+enrichment and routing systems
+fallback and recovery designs
+internal notes and documentation
+Notes
 
-Most of the work in this folder was created for private/internal use or project-based systems.
+Most of the work in this folder was originally created for internal or project-based use.
 
-Public repository versions may be cleaned, shortened, or simplified compared to production-style internal workflows.
+Public versions may be simplified or cleaned up, but they reflect the actual structure and working style behind the systems.
